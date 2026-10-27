@@ -58,22 +58,33 @@ See `EngineConfig` (`src/config.rs`) for the four axes from the design doc:
 
 The default `HashingEmbedder` is a deterministic CPU stand-in so the full scan → fetch → rerank loop runs without GPU drivers. Swap in MLX / CUDA / ONNX by implementing the `Embedder` trait (`src/rerank.rs`).
 
-## Benchmarks
+## Benchmarks (MRL embeddings required)
 
-Recall + ingest suite (JSON, for baseline / regression compares):
+The design assumes **Matryoshka** embeddings. The primary suite loads real MRL
+vectors for SEC 10-K chunks, generated on Modal:
 
 ```bash
+pip install -r modal/requirements.txt
+export MODAL_TOKEN_ID=...
+export MODAL_TOKEN_SECRET=...
+modal run modal/embed_sec10k_mrl.py --limit 50000 --download-dir data/sec10k_mrl
+
 cargo build --release
-./target/release/mrl-index bench-suite --label run --out bench_results/run.json
+./target/release/mrl-index bench-suite \
+  --embeddings data/sec10k_mrl \
+  --out bench_results/mrl_sec10k.json
 ```
 
-Criterion micro-bench:
+- Dataset: [`astr010/sec-10k-lsh-chunks`](https://huggingface.co/datasets/astr010/sec-10k-lsh-chunks)
+- Model: [`nomic-ai/nomic-embed-text-v1.5`](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) (MRL, truncated to 384-d)
+
+Plumbing-only isotropic vectors (not an MRL evaluation):
 
 ```bash
-cargo bench -p mrl_index --bench scan_bench
+./target/release/mrl-index bench-suite --synthetic --out bench_results/synthetic.json
 ```
 
-See `bench_results/DELTA.md` for the baseline → fix comparison after the Stratum-1 / FWHT / ingest-reload fixes.
+See `bench_results/DELTA.md` for the earlier baseline → fix comparison (synthetic).
 
 ## Develop
 

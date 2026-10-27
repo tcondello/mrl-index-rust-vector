@@ -11,6 +11,7 @@
 pub mod benchmark;
 pub mod block;
 pub mod config;
+pub mod corpus;
 pub mod embed;
 pub mod engine;
 pub mod passage;

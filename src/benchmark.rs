@@ -1,7 +1,11 @@
 //! Reproducible recall / latency / ingest benchmark suite.
 //!
-//! Used to establish a baseline before algorithmic fixes and to measure deltas.
+//! Primary path: Modal-generated **MRL** embeddings from
+//! `astr010/sec-10k-lsh-chunks` (`data/sec10k_mrl/`). Isotropic random vectors
+//! are available only via `--synthetic` for plumbing tests — they do **not**
+//! evaluate the MRL-prefix design.
 
+use std::path::Path;
 use std::time::Instant;
 
 use rand::{Rng, SeedableRng};
@@ -10,6 +14,7 @@ use serde::Serialize;
 
 use crate::block::{source, PaxBlock64, VECTORS_PER_BLOCK};
 use crate::config::{EngineConfig, SlabResidency, StrataDepth};
+use crate::corpus::MrlCorpus;
 use crate::embed::dot;
 use crate::engine::IndexEngine;
 use crate::quantize::encode_block;
@@ -18,6 +23,9 @@ use crate::scan::{scan_blocks, QueryPlan, ScoredHit};
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanRecallReport {
     pub label: String,
+    pub corpus: String,
+    pub mrl: bool,
+    pub model: Option<String>,
     pub n_vectors: usize,
     pub n_queries: usize,
     pub dims: usize,
@@ -27,7 +35,6 @@ pub struct ScanRecallReport {
     pub recall_at_shortlist: f64,
     pub mean_scan_ms: f64,
     pub mvecs_per_sec: f64,
-    pub mean_exact_overlap_at_10: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,17 +67,6 @@ fn l2_normalize(v: &mut [f32]) {
     for x in v {
         *x /= n;
     }
-}
-
-fn random_unit(rng: &mut ChaCha8Rng, dims: usize) -> Vec<f32> {
-    let mut v: Vec<f32> = (0..dims).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    l2_normalize(&mut v);
-    v
-}
-
-fn make_corpus(n: usize, dims: usize, seed: u64) -> Vec<Vec<f32>> {
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    (0..n).map(|_| random_unit(&mut rng, dims)).collect()
 }
 
 fn encode_corpus(vecs: &[Vec<f32>], dims: usize) -> Vec<PaxBlock64> {
@@ -108,24 +104,24 @@ fn recall_overlap(truth: &[(usize, f32)], pred_ids: &[usize], k: usize) -> f64 {
         return 1.0;
     }
     let got: usize = pred_ids.iter().filter(|id| want.contains(id)).count();
-    // Cap by min(k, shortlist size) for fair rate.
     let denom = want.len().min(pred_ids.len()).max(1);
     got as f64 / denom as f64
 }
 
-/// Scan recall + latency against exact brute-force top-k on synthetic unit vectors.
-pub fn run_scan_recall_bench(
+fn run_scan_on_vectors(
     label: &str,
-    n_vectors: usize,
-    n_queries: usize,
-    dims: usize,
+    corpus_name: &str,
+    mrl: bool,
+    model: Option<String>,
+    vectors: &[Vec<f32>],
+    query_indices: &[usize],
     shortlist: usize,
     strata: StrataDepth,
-    seed: u64,
 ) -> ScanRecallReport {
-    let corpus = make_corpus(n_vectors, dims, seed);
-    let blocks = encode_corpus(&corpus, dims);
-    let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xDEAD_BEEF);
+    let dims = vectors[0].len();
+    let n_vectors = vectors.len();
+    let n_queries = query_indices.len();
+    let blocks = encode_corpus(vectors, dims);
 
     let mut cfg = EngineConfig::default();
     cfg.embed_dims = dims;
@@ -137,16 +133,18 @@ pub fn run_scan_recall_bench(
     let mut recall_sl = 0.0;
     let mut scan_ms_sum = 0.0;
 
-    for _ in 0..n_queries {
-        let q = random_unit(&mut rng, dims);
-        let truth = exact_topk(&q, &corpus, shortlist.max(10));
-        let plan = QueryPlan::from_query(&q, dims);
+    for &qi in query_indices {
+        let q = &vectors[qi];
+        let truth = exact_topk(q, vectors, shortlist.max(10));
+        // Exclude the query doc itself from truth for retrieval-style scoring.
+        let truth: Vec<(usize, f32)> = truth.into_iter().filter(|(i, _)| *i != qi).collect();
+        let plan = QueryPlan::from_query(q, dims);
 
         let t = Instant::now();
         let hits = scan_blocks(&blocks, &plan, &cfg, None, None);
         scan_ms_sum += t.elapsed().as_secs_f64() * 1000.0;
 
-        let ids = hit_ids(&hits);
+        let ids: Vec<usize> = hit_ids(&hits).into_iter().filter(|i| *i != qi).collect();
         recall10 += recall_overlap(&truth, &ids, 10);
         recall_sl += recall_overlap(&truth, &ids, shortlist);
     }
@@ -156,6 +154,9 @@ pub fn run_scan_recall_bench(
 
     ScanRecallReport {
         label: label.into(),
+        corpus: corpus_name.into(),
+        mrl,
+        model,
         n_vectors,
         n_queries,
         dims,
@@ -165,11 +166,73 @@ pub fn run_scan_recall_bench(
         recall_at_shortlist: recall_sl / n_queries as f64,
         mean_scan_ms,
         mvecs_per_sec: mvecs,
-        mean_exact_overlap_at_10: recall10 / n_queries as f64,
     }
 }
 
-/// End-to-end ingest timing (exposes quadratic segment reload cost).
+/// Primary bench: real MRL embeddings from Modal (`data/sec10k_mrl`).
+pub fn run_scan_recall_mrl(
+    label: &str,
+    embeddings_dir: &Path,
+    n_queries: usize,
+    shortlist: usize,
+    strata: StrataDepth,
+    seed: u64,
+) -> Result<ScanRecallReport, crate::corpus::CorpusError> {
+    let corpus = MrlCorpus::load(embeddings_dir)?;
+    let vectors = corpus.all_vectors();
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let n = vectors.len();
+    let n_queries = n_queries.min(n.max(1));
+    let mut query_indices = Vec::with_capacity(n_queries);
+    while query_indices.len() < n_queries {
+        let i = rng.gen_range(0..n);
+        if !query_indices.contains(&i) {
+            query_indices.push(i);
+        }
+    }
+    Ok(run_scan_on_vectors(
+        label,
+        &format!("{} / {}", corpus.manifest.dataset, embeddings_dir.display()),
+        true,
+        Some(corpus.manifest.model.clone()),
+        &vectors,
+        &query_indices,
+        shortlist,
+        strata,
+    ))
+}
+
+/// Plumbing-only: isotropic random unit vectors (NOT an MRL evaluation).
+pub fn run_scan_recall_synthetic(
+    label: &str,
+    n_vectors: usize,
+    n_queries: usize,
+    dims: usize,
+    shortlist: usize,
+    strata: StrataDepth,
+    seed: u64,
+) -> ScanRecallReport {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let vectors: Vec<Vec<f32>> = (0..n_vectors)
+        .map(|_| {
+            let mut v: Vec<f32> = (0..dims).map(|_| rng.gen_range(-1.0..1.0)).collect();
+            l2_normalize(&mut v);
+            v
+        })
+        .collect();
+    let query_indices: Vec<usize> = (0..n_queries.min(n_vectors)).collect();
+    run_scan_on_vectors(
+        label,
+        "synthetic_isotropic_unit",
+        false,
+        None,
+        &vectors,
+        &query_indices,
+        shortlist,
+        strata,
+    )
+}
+
 pub fn run_ingest_bench(label: &str, n_docs: usize, dims: usize) -> IngestReport {
     let dir = std::env::temp_dir().join(format!(
         "mrl-bench-ingest-{}-{}",
@@ -211,24 +274,25 @@ pub fn run_ingest_bench(label: &str, n_docs: usize, dims: usize) -> IngestReport
     }
 }
 
-/// Full suite used for baseline → fix → compare.
-pub fn run_suite(label: &str) -> BenchSuiteReport {
-    // Sized to finish in seconds on a laptop while stressing pruning + ingest.
-    let scan = run_scan_recall_bench(
+/// Full suite against Modal MRL artifacts.
+pub fn run_suite_mrl(
+    label: &str,
+    embeddings_dir: &Path,
+) -> Result<BenchSuiteReport, crate::corpus::CorpusError> {
+    let scan = run_scan_recall_mrl(
         label,
-        8_192, // 128 PaxBlocks
-        32,
-        384,
+        embeddings_dir,
+        64,
         64,
         StrataDepth::L1Rabitq,
         42,
-    );
-    let ingest = run_ingest_bench(label, 4_096, 384);
-    BenchSuiteReport {
+    )?;
+    let ingest = run_ingest_bench(label, 4_096, scan.dims);
+    Ok(BenchSuiteReport {
         label: label.into(),
         scan,
         ingest,
-    }
+    })
 }
 
 impl BenchSuiteReport {
@@ -238,6 +302,12 @@ impl BenchSuiteReport {
 
     pub fn print_summary(&self) {
         println!("=== mrl-index bench suite [{}] ===", self.label);
+        println!(
+            "corpus: {}  mrl={}  model={}",
+            self.scan.corpus,
+            self.scan.mrl,
+            self.scan.model.as_deref().unwrap_or("-")
+        );
         println!(
             "scan:  n={} q={}  Recall@10={:.4}  Recall@SL={:.4}  scan={:.3} ms  ({:.2} Mvecs/s)",
             self.scan.n_vectors,

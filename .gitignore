@@ -1,1 +1,8 @@
 /target
+data/sec10k_mrl/embeddings.bin
+data/sec10k_mrl/texts.jsonl
+data/sec10k_mrl/manifest.json
+*.bin
+__pycache__/
+.venv/
+.modal/

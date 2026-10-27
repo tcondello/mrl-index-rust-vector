@@ -67,12 +67,18 @@ enum Cmd {
         #[arg(long, default_value_t = 384)]
         dims: usize,
     },
-    /// Full recall + ingest suite (JSON report for baseline / post-fix compare).
+    /// Full recall + ingest suite against Modal MRL embeddings (or --synthetic plumbing).
     BenchSuite {
         #[arg(long, default_value = "run")]
         label: String,
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Directory with manifest.json + embeddings.bin + texts.jsonl from Modal.
+        #[arg(long, default_value = "data/sec10k_mrl")]
+        embeddings: PathBuf,
+        /// Use isotropic random vectors (NOT an MRL evaluation — plumbing only).
+        #[arg(long)]
+        synthetic: bool,
     },
 }
 
@@ -183,8 +189,39 @@ fn main() -> Result<()> {
         Cmd::Bench { blocks, dims } => {
             run_bench(blocks, dims)?;
         }
-        Cmd::BenchSuite { label, out } => {
-            let report = mrl_index::benchmark::run_suite(&label);
+        Cmd::BenchSuite {
+            label,
+            out,
+            embeddings,
+            synthetic,
+        } => {
+            let report = if synthetic {
+                eprintln!(
+                    "warning: --synthetic uses isotropic unit vectors; this is NOT an MRL evaluation"
+                );
+                let scan = mrl_index::benchmark::run_scan_recall_synthetic(
+                    &label,
+                    8_192,
+                    32,
+                    384,
+                    64,
+                    StrataDepth::L1Rabitq,
+                    42,
+                );
+                let ingest = mrl_index::benchmark::run_ingest_bench(&label, 4_096, 384);
+                mrl_index::benchmark::BenchSuiteReport {
+                    label: label.clone(),
+                    scan,
+                    ingest,
+                }
+            } else {
+                mrl_index::benchmark::run_suite_mrl(&label, &embeddings).with_context(|| {
+                    format!(
+                        "load MRL embeddings from {} — run: modal run modal/embed_sec10k_mrl.py",
+                        embeddings.display()
+                    )
+                })?
+            };
             report.print_summary();
             if let Some(path) = out {
                 if let Some(parent) = path.parent() {
