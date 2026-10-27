@@ -82,12 +82,16 @@ fn quantize_vector(vec: &[f32]) -> (VectorMeta, [u8; MRL_PREFIX_DIMS], [u8; RABI
         rabitq[i] = if rotated[i] >= 0.0 { 1 } else { 0 };
     }
 
-    let mut tail_sq = 0.0f32;
+    // Residual L2 after the leading MRL prefix (dims 64..) — used for CS bounds.
+    let mut rest_sq = 0.0f32;
+    for &x in mid {
+        rest_sq += x * x;
+    }
     for &x in tail {
-        tail_sq += x * x;
+        rest_sq += x * x;
     }
 
-    let meta = VectorMeta::from_f32(scale, offset, tail_sq.sqrt(), 0);
+    let meta = VectorMeta::from_f32(scale, offset, rest_sq.sqrt(), 0);
     (meta, bits4, rabitq)
 }
 

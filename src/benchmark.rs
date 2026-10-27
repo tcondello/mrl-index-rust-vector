@@ -31,8 +31,12 @@ pub struct ScanRecallReport {
     pub dims: usize,
     pub shortlist: usize,
     pub strata: String,
-    pub recall_at_10: f64,
-    pub recall_at_shortlist: f64,
+    /// Fraction of exact top-10 that appear anywhere in the scan shortlist (order-free).
+    pub shortlist_coverage_at_10: f64,
+    /// Recall@10 after exact IP rerank of the shortlist (design-faithful end-to-end).
+    pub reranked_recall_at_10: f64,
+    /// Legacy: Recall@10 by scan-score order (not the production metric).
+    pub scan_ranked_recall_at_10: f64,
     pub mean_scan_ms: f64,
     pub mvecs_per_sec: f64,
 }
@@ -129,15 +133,17 @@ fn run_scan_on_vectors(
     cfg.strata_depth = strata;
     cfg.temporal_filter_enable = false;
 
-    let mut recall10 = 0.0;
-    let mut recall_sl = 0.0;
+    let mut coverage10 = 0.0;
+    let mut reranked10 = 0.0;
+    let mut scan_ranked10 = 0.0;
     let mut scan_ms_sum = 0.0;
 
     for &qi in query_indices {
         let q = &vectors[qi];
         let truth = exact_topk(q, vectors, shortlist.max(10));
-        // Exclude the query doc itself from truth for retrieval-style scoring.
         let truth: Vec<(usize, f32)> = truth.into_iter().filter(|(i, _)| *i != qi).collect();
+        let truth10: std::collections::HashSet<usize> =
+            truth.iter().take(10).map(|(i, _)| *i).collect();
         let plan = QueryPlan::from_query(q, dims);
 
         let t = Instant::now();
@@ -145,8 +151,22 @@ fn run_scan_on_vectors(
         scan_ms_sum += t.elapsed().as_secs_f64() * 1000.0;
 
         let ids: Vec<usize> = hit_ids(&hits).into_iter().filter(|i| *i != qi).collect();
-        recall10 += recall_overlap(&truth, &ids, 10);
-        recall_sl += recall_overlap(&truth, &ids, shortlist);
+
+        // Coverage: any order in shortlist.
+        let covered = truth10.iter().filter(|i| ids.contains(i)).count() as f64 / 10.0;
+        coverage10 += covered;
+
+        // Scan-ranked R@10 (legacy / misleading for hybrid design).
+        scan_ranked10 += recall_overlap(&truth, &ids, 10);
+
+        // Design-faithful: exact-IP rerank of shortlist, then R@10.
+        let mut reranked: Vec<(usize, f32)> = ids
+            .iter()
+            .map(|&i| (i, dot(q, &vectors[i])))
+            .collect();
+        reranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let rerank_ids: Vec<usize> = reranked.into_iter().map(|(i, _)| i).collect();
+        reranked10 += recall_overlap(&truth, &rerank_ids, 10);
     }
 
     let mean_scan_ms = scan_ms_sum / n_queries as f64;
@@ -162,8 +182,9 @@ fn run_scan_on_vectors(
         dims,
         shortlist,
         strata: strata_name(strata),
-        recall_at_10: recall10 / n_queries as f64,
-        recall_at_shortlist: recall_sl / n_queries as f64,
+        shortlist_coverage_at_10: coverage10 / n_queries as f64,
+        reranked_recall_at_10: reranked10 / n_queries as f64,
+        scan_ranked_recall_at_10: scan_ranked10 / n_queries as f64,
         mean_scan_ms,
         mvecs_per_sec: mvecs,
     }
@@ -279,11 +300,12 @@ pub fn run_suite_mrl(
     label: &str,
     embeddings_dir: &Path,
 ) -> Result<BenchSuiteReport, crate::corpus::CorpusError> {
+    // L1_RABITQ now scores full 4-bit prefix + RaBitQ (planes always on disk).
     let scan = run_scan_recall_mrl(
         label,
         embeddings_dir,
         64,
-        64,
+        128, // larger shortlist → higher coverage before JIT rerank
         StrataDepth::L1Rabitq,
         42,
     )?;
@@ -309,11 +331,12 @@ impl BenchSuiteReport {
             self.scan.model.as_deref().unwrap_or("-")
         );
         println!(
-            "scan:  n={} q={}  Recall@10={:.4}  Recall@SL={:.4}  scan={:.3} ms  ({:.2} Mvecs/s)",
+            "scan:  n={} q={}  shortlist_cov@10={:.4}  reranked_R@10={:.4}  (scan-ranked_R@10={:.4})  scan={:.3} ms  ({:.2} Mvecs/s)",
             self.scan.n_vectors,
             self.scan.n_queries,
-            self.scan.recall_at_10,
-            self.scan.recall_at_shortlist,
+            self.scan.shortlist_coverage_at_10,
+            self.scan.reranked_recall_at_10,
+            self.scan.scan_ranked_recall_at_10,
             self.scan.mean_scan_ms,
             self.scan.mvecs_per_sec
         );

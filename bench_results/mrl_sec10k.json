@@ -1,26 +1,27 @@
 {
-  "label": "mrl_sec10k",
+  "label": "mrl_fixed",
   "scan": {
-    "label": "mrl_sec10k",
+    "label": "mrl_fixed",
     "corpus": "astr010/sec-10k-lsh-chunks / data/sec10k_mrl",
     "mrl": true,
     "model": "nomic-ai/nomic-embed-text-v1.5",
     "n_vectors": 8192,
     "n_queries": 64,
     "dims": 384,
-    "shortlist": 64,
+    "shortlist": 128,
     "strata": "l1_rabitq",
-    "recall_at_10": 0.3906250000000001,
-    "recall_at_shortlist": 0.1713789682539682,
-    "mean_scan_ms": 1.334277296875,
-    "mvecs_per_sec": 6.139653293349453
+    "shortlist_coverage_at_10": 0.9765625,
+    "reranked_recall_at_10": 0.9765625,
+    "scan_ranked_recall_at_10": 0.9765625,
+    "mean_scan_ms": 2.0454409687500004,
+    "mvecs_per_sec": 4.005004360994223
   },
   "ingest": {
-    "label": "mrl_sec10k",
+    "label": "mrl_fixed",
     "n_docs": 4096,
     "dims": 384,
-    "total_ms": 16.960229,
-    "docs_per_sec": 241506.1730593378,
+    "total_ms": 17.524376,
+    "docs_per_sec": 233731.57480757087,
     "blocks_written": 64
   }
 }

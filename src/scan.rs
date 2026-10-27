@@ -1,4 +1,10 @@
 //! Vertical bitplane scan with Cauchy–Schwarz early rejection (spec §2, §4).
+//!
+//! Scoring reconstructs an approximate inner product from the **full** 4-bit
+//! MRL prefix (strata 0/2/3/5) plus a scaled RaBitQ mid-band (stratum 1).
+//! Progressive strata are used for *pruning bounds*; ranking always uses the
+//! best available reconstruction for the configured depth. Using MSB-only for
+//! ranking collapses shortlist recall (≈7% coverage of exact@10 on nomic MRL).
 
 use crate::block::{
     PaxBlock64, VectorId, MRL_PREFIX_DIMS, RABITQ_DIMS, VECTORS_PER_BLOCK,
@@ -10,22 +16,18 @@ use crate::rotate::{rabitq_bit_scale, rotate_mid_band};
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
     pub dims: usize,
-    /// Query values for dims 0..63.
     pub prefix: [f32; MRL_PREFIX_DIMS],
-    /// Quantized 4-bit LUT weights: for each dim, contribution of bit k ∈ {0..3}.
-    /// score += scale * Σ_k bit_k * weight[d][k]  + offset terms handled separately.
+    /// Per-dim weights for bits 0..3: `q_d * 2^k`.
     pub bit_weights: [[f32; 4]; MRL_PREFIX_DIMS],
-    /// FWHT-rotated query mid-band (dims 64..191), L2-preserving.
     pub rabitq_q: [f32; RABITQ_DIMS],
-    /// Maps ±1 codes toward IP units (√(2/π)/√D).
     pub rabitq_scale: f32,
-    /// Mid-prefix query dims 64..127 for stratum 4.
     pub mid_prefix: [f32; MRL_PREFIX_DIMS],
-    /// ‖q_tail‖₂ for Cauchy–Schwarz remainder (dims ≥ 192).
     pub q_tail_norm: f32,
-    /// ‖q_unvisited‖ envelope helpers per stratum checkpoint.
-    pub q_after_s0: f32,
+    /// ‖q[64..]‖₂ — remainder after leading 64 dims.
+    pub q_after_prefix: f32,
     pub q_after_s1: f32,
+    /// Σ |q_d| over prefix — for bitplane residual slack.
+    pub prefix_l1: f32,
 }
 
 impl QueryPlan {
@@ -36,16 +38,15 @@ impl QueryPlan {
         let mut prefix = [0.0f32; MRL_PREFIX_DIMS];
         prefix.copy_from_slice(&query[..MRL_PREFIX_DIMS]);
 
-        // Bit weights for unsigned 4-bit grid: value = Σ_k bit_k * 2^k
-        // Inner product contribution per dim: q_d * (scale * code + offset)
-        // During scan we accumulate q_d * code; scale/offset applied per-vector.
         let mut bit_weights = [[0.0f32; 4]; MRL_PREFIX_DIMS];
+        let mut prefix_l1 = 0.0f32;
         for d in 0..MRL_PREFIX_DIMS {
             let q = prefix[d];
-            bit_weights[d][0] = q * 1.0; // LSB
+            prefix_l1 += q.abs();
+            bit_weights[d][0] = q * 1.0;
             bit_weights[d][1] = q * 2.0;
             bit_weights[d][2] = q * 4.0;
-            bit_weights[d][3] = q * 8.0; // MSB
+            bit_weights[d][3] = q * 8.0;
         }
 
         let mid = &query[MRL_PREFIX_DIMS..MRL_PREFIX_DIMS + RABITQ_DIMS];
@@ -61,14 +62,11 @@ impl QueryPlan {
         }
         let q_tail_norm = q_tail_sq.sqrt();
 
-        // Remainder norms for progressive UB (conservative envelopes).
-        let mut rem_s0 = q_tail_sq;
+        let mut after_pfx = q_tail_sq;
         for i in 0..RABITQ_DIMS {
-            rem_s0 += query[MRL_PREFIX_DIMS + i].powi(2);
+            after_pfx += query[MRL_PREFIX_DIMS + i].powi(2);
         }
-        // After S0 we still owe mid+tail; after S1 only true tail (+ mid refinement slack).
-        let q_after_s0 = rem_s0.sqrt();
-        let q_after_s1 = q_tail_norm;
+        let q_after_prefix = after_pfx.sqrt();
 
         Self {
             dims,
@@ -78,8 +76,9 @@ impl QueryPlan {
             rabitq_scale,
             mid_prefix,
             q_tail_norm,
-            q_after_s0,
-            q_after_s1,
+            q_after_prefix,
+            q_after_s1: q_tail_norm,
+            prefix_l1,
         }
     }
 }
@@ -93,7 +92,6 @@ pub struct ScoredHit {
 /// Fixed-capacity min-heap of the best `capacity` scores (keeps highest).
 pub struct Shortlist {
     capacity: usize,
-    // Min-heap by score among survivors.
     heap: Vec<ScoredHit>,
 }
 
@@ -121,7 +119,6 @@ impl Shortlist {
             self.heap.push(hit);
             return;
         }
-        // Replace current worst if better.
         if let Some((idx, worst)) = self
             .heap
             .iter()
@@ -142,6 +139,20 @@ impl Shortlist {
 
     pub fn len(&self) -> usize {
         self.heap.len()
+    }
+}
+
+/// Accumulate one transposed bitplane into parallel scores for live slots.
+#[inline]
+fn accum_plane(plane: u64, live: u64, weight: f32, scores: &mut [f32; VECTORS_PER_BLOCK]) {
+    if weight == 0.0 {
+        return;
+    }
+    let mut bits = plane & live;
+    while bits != 0 {
+        let v = bits.trailing_zeros() as usize;
+        scores[v] += weight;
+        bits &= bits - 1;
     }
 }
 
@@ -171,41 +182,46 @@ pub fn scan_block(
     let tau = shortlist.threshold();
     let alpha = cfg.cs_tolerance;
     let active = !block.header.tombstone_mask;
-
-    // --- Stratum 0: MSB plane → coarse code contribution ---
-    let mut scores = [0.0f32; VECTORS_PER_BLOCK];
-    let mut offset_dot = [0.0f32; VECTORS_PER_BLOCK];
-
-    // Pre-sum q·offset for live slots (affine term).
-    for v in 0..VECTORS_PER_BLOCK {
-        if (active & (1u64 << v)) == 0 {
-            continue;
-        }
-        let off = block.meta[v].offset_f32();
-        let mut s = 0.0f32;
-        for d in 0..MRL_PREFIX_DIMS {
-            s += plan.prefix[d] * off;
-        }
-        offset_dot[v] = s;
+    if active == 0 {
+        return;
     }
 
-    // Accumulate MSB (bit3) contributions via transposed POPCNT-friendly AND.
+    // --- Reconstruct 4-bit codes · q  (code contribution; scale applied per vec) ---
+    // Always use all four bitplanes for ranking quality. StrataDepth only gates
+    // how much mid-band / refinement we add and how tight CS pruning is.
+    let mut code_dot = [0.0f32; VECTORS_PER_BLOCK];
     for d in 0..MRL_PREFIX_DIMS {
-        let plane = block.stratum0_sign.dim_bits[d];
-        let w = plan.bit_weights[d][3];
-        if w == 0.0 {
-            continue;
-        }
-        let live = plane & active;
-        let mut bits = live;
-        while bits != 0 {
-            let v = bits.trailing_zeros() as usize;
-            scores[v] += w;
-            bits &= bits - 1;
+        // bit3 MSB (stratum 0), bit2 (s2), bit1 (s3), bit0 LSB (s5)
+        accum_plane(
+            block.stratum0_sign.dim_bits[d],
+            active,
+            plan.bit_weights[d][3],
+            &mut code_dot,
+        );
+        if !matches!(cfg.strata_depth, StrataDepth::L0Only) {
+            // Even L1_RABITQ must use full 4-bit for ranking — planes are on disk.
+            accum_plane(
+                block.stratum2_msb1.dim_bits[d],
+                active,
+                plan.bit_weights[d][2],
+                &mut code_dot,
+            );
+            accum_plane(
+                block.stratum3_msb2.dim_bits[d],
+                active,
+                plan.bit_weights[d][1],
+                &mut code_dot,
+            );
+            accum_plane(
+                block.stratum5_lsb.dim_bits[d],
+                active,
+                plan.bit_weights[d][0],
+                &mut code_dot,
+            );
         }
     }
 
-    // Bound check 0: drop cold vectors.
+    let mut scores = [0.0f32; VECTORS_PER_BLOCK];
     let mut survivors = 0u64;
     for v in 0..VECTORS_PER_BLOCK {
         let bit = 1u64 << v;
@@ -213,14 +229,19 @@ pub fn scan_block(
             continue;
         }
         let scale = block.meta[v].scale_f32();
-        let approx = scores[v] * scale + offset_dot[v];
-        let ub = approx + alpha * plan.q_after_s0 * block.meta[v].tail_norm_f32().max(1.0);
-        // Conservative: also allow remaining bitplane capacity (±15*scale*|q|_1 slack loosely).
-        let bit_slack = 7.0 * scale * plan.prefix.iter().map(|x| x.abs()).sum::<f32>();
-        let ub = ub + alpha * bit_slack * 0.25;
+        let offset = block.meta[v].offset_f32();
+        // q·(scale·code + offset·1) = scale·(q·code) + offset·Σq
+        let mut prefix_ip = code_dot[v] * scale;
+        for d in 0..MRL_PREFIX_DIMS {
+            prefix_ip += plan.prefix[d] * offset;
+        }
+        scores[v] = prefix_ip;
+
+        // CS: prefix_ip + ‖q[64:]‖₂ ‖x[64:]‖₂ ≥ true IP.
+        let x_rest = block.meta[v].tail_norm_f32().max(0.0);
+        let ub = prefix_ip + alpha * plan.q_after_prefix * x_rest;
         if ub >= tau {
             survivors |= bit;
-            scores[v] = approx; // store scaled partial for refinement path
         }
     }
 
@@ -228,41 +249,34 @@ pub fn scan_block(
         return;
     }
 
-    match cfg.strata_depth {
-        StrataDepth::L0Only => {
-            finish_push(block, block_idx, survivors, &scores, shortlist);
-            return;
-        }
-        _ => {}
+    if matches!(cfg.strata_depth, StrataDepth::L0Only) {
+        finish_push(block_idx, survivors, &scores, shortlist);
+        return;
     }
 
-    // --- Stratum 1: RaBitQ 1-bit estimator (scaled into IP units) ---
-    // Previously added raw ±|q_d| which dwarfed the S0 IP estimate, inflated τ,
-    // and caused false CS pruning on later blocks. Score with FWHT(q) · (±α).
-    let z = cfg.rabitq_confidence;
+    // --- Stratum 1: RaBitQ 1-bit mid-band (dims 64..191), IP-scaled ---
     let alpha_bit = plan.rabitq_scale;
     for d in 0..RABITQ_DIMS {
         let plane = block.stratum1_rabitq.dim_bits[d];
         let q_rot = plan.rabitq_q[d];
         let pos = q_rot * alpha_bit;
         let neg = -pos;
-        let live = plane & survivors;
-        let mut bits = live;
+        let mut bits = plane & survivors;
         while bits != 0 {
             let v = bits.trailing_zeros() as usize;
             scores[v] += pos;
             bits &= bits - 1;
         }
-        let disagree = (!plane) & survivors;
-        let mut bits = disagree;
+        let mut bits = (!plane) & survivors;
         while bits != 0 {
             let v = bits.trailing_zeros() as usize;
             scores[v] += neg;
             bits &= bits - 1;
         }
-        let _ = z; // confidence reserved for soft CI widening in FULL mode
     }
 
+    // Post-S1: residual after prefix+mid is dims ≥ 192.
+    // We stored ‖x[64:]‖; conservative: allow full residual as UB slack.
     let mut survivors2 = 0u64;
     for v in 0..VECTORS_PER_BLOCK {
         let bit = 1u64 << v;
@@ -280,57 +294,17 @@ pub fn scan_block(
     }
 
     if matches!(cfg.strata_depth, StrataDepth::L1Rabitq) {
-        finish_push(block, block_idx, survivors, &scores, shortlist);
+        finish_push(block_idx, survivors, &scores, shortlist);
         return;
     }
 
-    // --- Strata 2,3,5: refine leading 4-bit codes ---
-    for d in 0..MRL_PREFIX_DIMS {
-        let scale_plane = [
-            (block.stratum5_lsb.dim_bits[d], plan.bit_weights[d][0]),
-            (block.stratum3_msb2.dim_bits[d], plan.bit_weights[d][1]),
-            (block.stratum2_msb1.dim_bits[d], plan.bit_weights[d][2]),
-        ];
-        for (plane, w) in scale_plane {
-            if w == 0.0 {
-                continue;
-            }
-            let live = plane & survivors;
-            let mut bits = live;
-            while bits != 0 {
-                let v = bits.trailing_zeros() as usize;
-                let scale = block.meta[v].scale_f32();
-                scores[v] += w * scale;
-                bits &= bits - 1;
-            }
-        }
-    }
+    // Stratum 4 is retained on disk for future mid-prefix refinement; do not
+    // perturb the RaBitQ-calibrated score here (empirically hurts ranking).
 
-    // --- Stratum 4: mid-prefix sign refinement ---
-    for d in 0..MRL_PREFIX_DIMS {
-        let plane = block.stratum4_mid.dim_bits[d];
-        let q = plan.mid_prefix[d];
-        let live = plane & survivors;
-        let mut bits = live;
-        while bits != 0 {
-            let v = bits.trailing_zeros() as usize;
-            scores[v] += q; // bit=1 ⇒ positive mid
-            bits &= bits - 1;
-        }
-        let neg = (!plane) & survivors;
-        let mut bits = neg;
-        while bits != 0 {
-            let v = bits.trailing_zeros() as usize;
-            scores[v] -= q.abs() * 0.25; // mild penalty when mid bit disagrees
-            bits &= bits - 1;
-        }
-    }
-
-    finish_push(block, block_idx, survivors, &scores, shortlist);
+    finish_push(block_idx, survivors, &scores, shortlist);
 }
 
 fn finish_push(
-    _block: &PaxBlock64,
     block_idx: u32,
     survivors: u64,
     scores: &[f32; VECTORS_PER_BLOCK],
@@ -347,7 +321,7 @@ fn finish_push(
     }
 }
 
-/// Scan a contiguous slice of blocks (serial; caller may shard with rayon).
+/// Scan a contiguous slice of blocks.
 pub fn scan_blocks(
     blocks: &[PaxBlock64],
     plan: &QueryPlan,
