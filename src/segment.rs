@@ -199,4 +199,26 @@ impl SegmentReader {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Append a newly written block in O(1) without remapping the whole segment.
+    ///
+    /// Previously `commit_block` reopened + recopied the entire file each flush
+    /// (O(N²) over ingest). For mmap-backed readers we materialise once into
+    /// `owned`, then push.
+    pub fn append_live(&mut self, block: PaxBlock64) {
+        if self.owned.is_empty() {
+            if let Some(mmap) = self.mmap.take() {
+                let n = mmap.len() / BLOCK_BYTES;
+                self.owned.reserve(n + 1);
+                for i in 0..n {
+                    let start = i * BLOCK_BYTES;
+                    let b = PaxBlock64::from_bytes(&mmap[start..start + BLOCK_BYTES])
+                        .expect("aligned block")
+                        .clone();
+                    self.owned.push(b);
+                }
+            }
+        }
+        self.owned.push(block);
+    }
 }

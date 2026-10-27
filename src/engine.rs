@@ -251,9 +251,8 @@ impl IndexEngine {
             w.block_count()
         };
 
-        // Refresh reader view.
-        let seg_path = self.dir.join("segments").join("000001.pax");
-        self.segment_reader = SegmentReader::open(&seg_path, self.config.slab_residency)?;
+        // O(1) live append — do not remap/recopy the whole segment (was O(N²)).
+        self.segment_reader.append_live(block);
         self.write_manifest(blocks_written)?;
         Ok(())
     }

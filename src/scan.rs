@@ -4,6 +4,7 @@ use crate::block::{
     PaxBlock64, VectorId, MRL_PREFIX_DIMS, RABITQ_DIMS, VECTORS_PER_BLOCK,
 };
 use crate::config::{EngineConfig, StrataDepth};
+use crate::rotate::{rabitq_bit_scale, rotate_mid_band};
 
 /// Precomputed query side for bitplane scoring.
 #[derive(Debug, Clone)]
@@ -14,9 +15,10 @@ pub struct QueryPlan {
     /// Quantized 4-bit LUT weights: for each dim, contribution of bit k ∈ {0..3}.
     /// score += scale * Σ_k bit_k * weight[d][k]  + offset terms handled separately.
     pub bit_weights: [[f32; 4]; MRL_PREFIX_DIMS],
-    /// RaBitQ query signs after same Rademacher rotation (dims 64..191).
-    pub rabitq_signs: [i8; RABITQ_DIMS],
-    pub rabitq_abs: [f32; RABITQ_DIMS],
+    /// FWHT-rotated query mid-band (dims 64..191), L2-preserving.
+    pub rabitq_q: [f32; RABITQ_DIMS],
+    /// Maps ±1 codes toward IP units (√(2/π)/√D).
+    pub rabitq_scale: f32,
     /// Mid-prefix query dims 64..127 for stratum 4.
     pub mid_prefix: [f32; MRL_PREFIX_DIMS],
     /// ‖q_tail‖₂ for Cauchy–Schwarz remainder (dims ≥ 192).
@@ -46,19 +48,9 @@ impl QueryPlan {
             bit_weights[d][3] = q * 8.0; // MSB
         }
 
-        let mut rabitq_signs = [0i8; RABITQ_DIMS];
-        let mut rabitq_abs = [0.0f32; RABITQ_DIMS];
-        const SEED: u64 = 0x4D52_4C5F_5241_4249;
-        for i in 0..RABITQ_DIMS {
-            let x = query[MRL_PREFIX_DIMS + i];
-            let h = SEED
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .wrapping_add(i as u64);
-            let sign = if h & 1 == 0 { 1.0f32 } else { -1.0f32 };
-            let r = x * sign;
-            rabitq_signs[i] = if r >= 0.0 { 1 } else { -1 };
-            rabitq_abs[i] = r.abs();
-        }
+        let mid = &query[MRL_PREFIX_DIMS..MRL_PREFIX_DIMS + RABITQ_DIMS];
+        let rabitq_q = rotate_mid_band(mid);
+        let rabitq_scale = rabitq_bit_scale();
 
         let mut mid_prefix = [0.0f32; MRL_PREFIX_DIMS];
         mid_prefix.copy_from_slice(&query[MRL_PREFIX_DIMS..MRL_PREFIX_DIMS + MRL_PREFIX_DIMS]);
@@ -82,8 +74,8 @@ impl QueryPlan {
             dims,
             prefix,
             bit_weights,
-            rabitq_signs,
-            rabitq_abs,
+            rabitq_q,
+            rabitq_scale,
             mid_prefix,
             q_tail_norm,
             q_after_s0,
@@ -244,26 +236,28 @@ pub fn scan_block(
         _ => {}
     }
 
-    // --- Stratum 1: RaBitQ 1-bit estimator ---
+    // --- Stratum 1: RaBitQ 1-bit estimator (scaled into IP units) ---
+    // Previously added raw ±|q_d| which dwarfed the S0 IP estimate, inflated τ,
+    // and caused false CS pruning on later blocks. Score with FWHT(q) · (±α).
     let z = cfg.rabitq_confidence;
+    let alpha_bit = plan.rabitq_scale;
     for d in 0..RABITQ_DIMS {
         let plane = block.stratum1_rabitq.dim_bits[d];
-        let qsign = plan.rabitq_signs[d];
-        let mag = plan.rabitq_abs[d];
-        // Agreement with query sign contributes +mag, disagreement −mag (scaled later lightly).
+        let q_rot = plan.rabitq_q[d];
+        let pos = q_rot * alpha_bit;
+        let neg = -pos;
         let live = plane & survivors;
-        let mut agree = live;
-        while agree != 0 {
-            let v = agree.trailing_zeros() as usize;
-            scores[v] += mag * qsign as f32;
-            agree &= agree - 1;
+        let mut bits = live;
+        while bits != 0 {
+            let v = bits.trailing_zeros() as usize;
+            scores[v] += pos;
+            bits &= bits - 1;
         }
-        // Vectors with bit=0 disagree when qsign>0 etc.
         let disagree = (!plane) & survivors;
         let mut bits = disagree;
         while bits != 0 {
             let v = bits.trailing_zeros() as usize;
-            scores[v] -= mag * qsign as f32;
+            scores[v] += neg;
             bits &= bits - 1;
         }
         let _ = z; // confidence reserved for soft CI widening in FULL mode

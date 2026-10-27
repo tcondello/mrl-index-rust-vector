@@ -67,6 +67,13 @@ enum Cmd {
         #[arg(long, default_value_t = 384)]
         dims: usize,
     },
+    /// Full recall + ingest suite (JSON report for baseline / post-fix compare).
+    BenchSuite {
+        #[arg(long, default_value = "run")]
+        label: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn parse_strata(s: &str) -> Result<StrataDepth> {
@@ -175,6 +182,17 @@ fn main() -> Result<()> {
         }
         Cmd::Bench { blocks, dims } => {
             run_bench(blocks, dims)?;
+        }
+        Cmd::BenchSuite { label, out } => {
+            let report = mrl_index::benchmark::run_suite(&label);
+            report.print_summary();
+            if let Some(path) = out {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, report.to_json_pretty())?;
+                println!("wrote {}", path.display());
+            }
         }
     }
     Ok(())

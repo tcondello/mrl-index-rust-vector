@@ -1,0 +1,24 @@
+{
+  "label": "baseline",
+  "scan": {
+    "label": "baseline",
+    "n_vectors": 8192,
+    "n_queries": 32,
+    "dims": 384,
+    "shortlist": 64,
+    "strata": "l1_rabitq",
+    "recall_at_10": 0.12812500000000004,
+    "recall_at_shortlist": 0.0869140625,
+    "mean_scan_ms": 0.65888953125,
+    "mvecs_per_sec": 12.43304015539403,
+    "mean_exact_overlap_at_10": 0.12812500000000004
+  },
+  "ingest": {
+    "label": "baseline",
+    "n_docs": 4096,
+    "dims": 384,
+    "total_ms": 15.282012,
+    "docs_per_sec": 268027.5345942668,
+    "blocks_written": 64
+  }
+}

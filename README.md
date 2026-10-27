@@ -58,11 +58,27 @@ See `EngineConfig` (`src/config.rs`) for the four axes from the design doc:
 
 The default `HashingEmbedder` is a deterministic CPU stand-in so the full scan → fetch → rerank loop runs without GPU drivers. Swap in MLX / CUDA / ONNX by implementing the `Embedder` trait (`src/rerank.rs`).
 
+## Benchmarks
+
+Recall + ingest suite (JSON, for baseline / regression compares):
+
+```bash
+cargo build --release
+./target/release/mrl-index bench-suite --label run --out bench_results/run.json
+```
+
+Criterion micro-bench:
+
+```bash
+cargo bench -p mrl_index --bench scan_bench
+```
+
+See `bench_results/DELTA.md` for the baseline → fix comparison after the Stratum-1 / FWHT / ingest-reload fixes.
+
 ## Develop
 
 ```bash
 cargo test
-cargo bench -p mrl_index --bench scan_bench
 ```
 
 ## License

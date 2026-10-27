@@ -4,9 +4,7 @@ use crate::block::{
     Bitplane64, PaxBlock64, RabitqPlane, VectorMeta, VECTORS_PER_BLOCK, MRL_PREFIX_DIMS,
     RABITQ_DIMS,
 };
-
-/// Orthogonal-ish Hadamard-style rotation seed for RaBitQ mid-band.
-const RABITQ_SEED: u64 = 0x4D52_4C5F_5241_4249; // "MRL_RABI"
+use crate::rotate::rotate_mid_band;
 
 /// Build a filled PaxBlock64 from up to 64 float vectors (row-major, `dims` each).
 pub fn encode_block(
@@ -76,10 +74,12 @@ fn quantize_vector(vec: &[f32]) -> (VectorMeta, [u8; MRL_PREFIX_DIMS], [u8; RABI
         bits4[i] = q;
     }
 
+    // Real orthogonal mix (FWHT). Per-coordinate ±1 flips are a no-op for
+    // sign-agreement tests and must not be used here.
+    let rotated = rotate_mid_band(mid);
     let mut rabitq = [0u8; RABITQ_DIMS];
-    for (i, &x) in mid.iter().enumerate() {
-        let rotated = rotate_coord(x, i);
-        rabitq[i] = if rotated >= 0.0 { 1 } else { 0 };
+    for i in 0..RABITQ_DIMS {
+        rabitq[i] = if rotated[i] >= 0.0 { 1 } else { 0 };
     }
 
     let mut tail_sq = 0.0f32;
@@ -89,16 +89,6 @@ fn quantize_vector(vec: &[f32]) -> (VectorMeta, [u8; MRL_PREFIX_DIMS], [u8; RABI
 
     let meta = VectorMeta::from_f32(scale, offset, tail_sq.sqrt(), 0);
     (meta, bits4, rabitq)
-}
-
-#[inline]
-fn rotate_coord(x: f32, dim: usize) -> f32 {
-    // Deterministic ±1 Rademacher from seed — stands in for a full orthogonal R.
-    let h = RABITQ_SEED
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(dim as u64);
-    let sign = if h & 1 == 0 { 1.0f32 } else { -1.0f32 };
-    x * sign
 }
 
 fn write_4bit_planes(block: &mut PaxBlock64, slot: usize, bits4: &[u8; MRL_PREFIX_DIMS]) {

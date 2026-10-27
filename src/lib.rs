@@ -8,6 +8,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+pub mod benchmark;
 pub mod block;
 pub mod config;
 pub mod embed;
@@ -16,6 +17,7 @@ pub mod passage;
 pub mod quantize;
 pub mod rerank;
 pub mod ring;
+pub mod rotate;
 pub mod scan;
 pub mod segment;
 
