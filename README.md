@@ -65,9 +65,12 @@ vectors for SEC 10-K chunks, generated on Modal:
 
 ```bash
 pip install -r modal/requirements.txt
-export MODAL_TOKEN_ID=...
-export MODAL_TOKEN_SECRET=...
+./scripts/check_modal_auth.sh   # MODAL_* in Cursor Environment secrets; start a new agent run
 modal run modal/embed_sec10k_mrl.py --limit 50000 --download-dir data/sec10k_mrl
+
+# or CPU fallback:
+pip install -r modal/requirements-embed.txt
+python3 scripts/embed_sec10k_local.py --limit 8192 --out data/sec10k_mrl
 
 cargo build --release
 ./target/release/mrl-index bench-suite \
