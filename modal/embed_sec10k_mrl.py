@@ -39,10 +39,11 @@ image = (
     .pip_install(
         "torch==2.4.1",
         "sentence-transformers==3.3.1",
+        "transformers==4.46.3",
         "datasets==3.2.0",
+        "huggingface-hub==0.26.2",
         "einops",
         "numpy",
-        "huggingface_hub",
     )
     .env({"TOKENIZERS_PARALLELISM": "false"})
 )
