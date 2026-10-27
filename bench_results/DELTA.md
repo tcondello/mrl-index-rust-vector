@@ -1,5 +1,9 @@
 # Benchmark delta: baseline → post_fix
 
+> **Note:** These numbers used **isotropic synthetic** unit vectors (`--synthetic`),
+> not MRL embeddings. Prefer `bench-suite --embeddings data/sec10k_mrl` after
+> running `modal/embed_sec10k_mrl.py` for design-faithful recall.
+
 Suite: 8192 vectors × 32 queries × 384-d, shortlist=64, `L1_RABITQ`; ingest 4096 docs.
 
 | Metric | Baseline (buggy) | Post-fix | Δ |
