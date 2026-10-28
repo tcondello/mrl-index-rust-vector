@@ -443,7 +443,8 @@ pub fn scan_blocks(
             );
         }
         let rest = &blocks[warmup..];
-        let chunk_size = ((rest.len() + 7) / 8).max(16);
+        let shards = (rayon::current_num_threads() * 2).max(8);
+        let chunk_size = ((rest.len() + shards - 1) / shards).max(16);
         let floor_tau = shortlist.threshold();
         let partials: Vec<Shortlist> = rest
             .par_chunks(chunk_size)
