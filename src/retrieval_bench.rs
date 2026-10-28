@@ -2,6 +2,9 @@
 //!
 //! Uses **separate query embeddings** + **precomputed exact neighbors** + **qrels**.
 //! This is not corpus self-retrieval and does not recompute brute-force GT at runtime.
+//!
+//! Corpus embeddings are **mmapped** so full-scale suites (~27 GiB at 8.8M × 768)
+//! fit on ~16 GiB hosts; only PaxBlocks (~4 KB / 64 vecs) stay resident in RAM.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -9,6 +12,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use memmap2::{Advice, Mmap, MmapOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::block::{source, PaxBlock64, VECTORS_PER_BLOCK};
@@ -57,11 +61,71 @@ struct QrelRow {
     score: i32,
 }
 
-#[derive(Debug, Clone)]
+/// Corpus float matrix backed by an immutable mmap (little-endian f32, row-major).
+pub struct MmapF32Matrix {
+    mmap: Mmap,
+    rows: usize,
+    dims: usize,
+}
+
+impl MmapF32Matrix {
+    pub fn open(path: &Path, rows: usize, dims: usize) -> Result<Self, CorpusError> {
+        let expected = rows
+            .checked_mul(dims)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or(CorpusError::CorruptSize {
+                expected: 0,
+                got: 0,
+            })?;
+        let file = File::open(path)?;
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        if mmap.len() != expected {
+            return Err(CorpusError::CorruptSize {
+                expected,
+                got: mmap.len(),
+            });
+        }
+        // bytemuck cast needs align(4); mmap offset is page-aligned so OK.
+        if mmap.as_ptr() as usize % std::mem::align_of::<f32>() != 0 {
+            return Err(CorpusError::CorruptSize {
+                expected,
+                got: mmap.len(),
+            });
+        }
+        Ok(Self { mmap, rows, dims })
+    }
+
+    pub fn advise_sequential(&self) {
+        let _ = self.mmap.advise(Advice::Sequential);
+    }
+
+    pub fn advise_random(&self) {
+        let _ = self.mmap.advise(Advice::Random);
+    }
+
+    pub fn as_slice(&self) -> &[f32] {
+        bytemuck::cast_slice(&self.mmap)
+    }
+
+    pub fn row(&self, i: usize) -> &[f32] {
+        debug_assert!(i < self.rows);
+        let d = self.dims;
+        &self.as_slice()[i * d..(i + 1) * d]
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn dims(&self) -> usize {
+        self.dims
+    }
+}
+
 pub struct RetrievalBenchData {
     pub dir: PathBuf,
     pub manifest: RetrievalManifest,
-    pub corpus_embeddings: Vec<f32>,
+    pub corpus_embeddings: MmapF32Matrix,
     pub query_embeddings: Vec<f32>,
     pub neighbors: Vec<Vec<usize>>,
     pub qrels: HashMap<usize, HashSet<usize>>,
@@ -101,16 +165,17 @@ impl RetrievalBenchData {
             .as_deref()
             .unwrap_or("qrels.jsonl");
 
-        let corpus_embeddings = read_f32_matrix(
+        eprintln!(
+            "mmap corpus embeddings {} (n={} dims={}) …",
+            manifest.embeddings_file, manifest.n, manifest.dims
+        );
+        let corpus_embeddings = MmapF32Matrix::open(
             &dir.join(&manifest.embeddings_file),
             manifest.n,
             manifest.dims,
         )?;
-        let query_embeddings = read_f32_matrix(
-            &dir.join(q_emb_name),
-            n_queries,
-            manifest.dims,
-        )?;
+        let query_embeddings =
+            read_f32_matrix(&dir.join(q_emb_name), n_queries, manifest.dims)?;
 
         let mut neighbors = vec![Vec::new(); n_queries];
         let nf = File::open(dir.join(neighbors_name))?;
@@ -165,8 +230,7 @@ impl RetrievalBenchData {
     }
 
     pub fn corpus_vector(&self, i: usize) -> &[f32] {
-        let d = self.dims();
-        &self.corpus_embeddings[i * d..(i + 1) * d]
+        self.corpus_embeddings.row(i)
     }
 
     pub fn query_vector(&self, i: usize) -> &[f32] {
@@ -192,18 +256,25 @@ fn read_f32_matrix(path: &Path, rows: usize, dims: usize) -> Result<Vec<f32>, Co
     Ok(out)
 }
 
-fn encode_corpus_flat(emb: &[f32], n: usize, dims: usize) -> Vec<PaxBlock64> {
+fn encode_corpus_mmap(emb: &MmapF32Matrix) -> Vec<PaxBlock64> {
+    let n = emb.rows();
+    let dims = emb.dims();
+    let slice = emb.as_slice();
     let mut blocks = Vec::with_capacity(n.div_ceil(VECTORS_PER_BLOCK));
     let mut i = 0;
+    let report_every = (n / 20).max(VECTORS_PER_BLOCK * 1024);
     while i < n {
         let end = (i + VECTORS_PER_BLOCK).min(n);
         let refs: Vec<&[f32]> = (i..end)
-            .map(|j| &emb[j * dims..(j + 1) * dims])
+            .map(|j| &slice[j * dims..(j + 1) * dims])
             .collect();
         let ts: Vec<u32> = (i..end).map(|j| j as u32).collect();
         let src = vec![source::DOC; end - i];
         blocks.push(encode_block(&refs, &ts, &src, dims));
         i = end;
+        if i % report_every < VECTORS_PER_BLOCK || i == n {
+            eprintln!("  encode blocks {}/{} vecs", i, n);
+        }
     }
     blocks
 }
@@ -256,6 +327,7 @@ pub struct RetrievalBenchReport {
     pub dims: usize,
     pub shortlist: usize,
     pub strata: String,
+    pub corpus_mmap: bool,
     pub shortlist_coverage_at_10: f64,
     pub reranked_recall_at_10: f64,
     pub reranked_recall_at_100: f64,
@@ -287,9 +359,18 @@ pub fn run_retrieval_bench(
     let q_total = data.n_queries();
     let n_queries = n_queries.unwrap_or(q_total).min(q_total);
 
+    // Sequential pass to build PaxBlocks from mmap, then random for rerank.
+    data.corpus_embeddings.advise_sequential();
     let t_enc = Instant::now();
-    let blocks = encode_corpus_flat(&data.corpus_embeddings, n, dims);
+    eprintln!("encode PaxBlocks n={n} dims={dims} …");
+    let blocks = encode_corpus_mmap(&data.corpus_embeddings);
     let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "encode done: {} blocks in {:.1} s",
+        blocks.len(),
+        encode_ms / 1000.0
+    );
+    data.corpus_embeddings.advise_random();
 
     let mut cfg = EngineConfig::default();
     cfg.embed_dims = dims;
@@ -305,6 +386,7 @@ pub fn run_retrieval_bench(
     let mut qrels_n = 0usize;
     let mut scan_ms_sum = 0.0;
 
+    let progress_every = (n_queries / 20).max(1);
     for qi in 0..n_queries {
         let q = data.query_vector(qi);
         let truth10: HashSet<usize> = data.neighbors[qi].iter().take(10).copied().collect();
@@ -335,6 +417,15 @@ pub fn run_retrieval_bench(
             qrels_ndcg += ndcg_at_k(rels, &rerank_ids, 10);
             qrels_n += 1;
         }
+
+        if (qi + 1) % progress_every == 0 || qi + 1 == n_queries {
+            let done = qi + 1;
+            let mean = scan_ms_sum / done as f64;
+            eprintln!(
+                "  queries {done}/{n_queries}  mean_scan={mean:.1} ms/q  eta≈{:.0}s",
+                mean * (n_queries - done) as f64 / 1000.0
+            );
+        }
     }
 
     let mean_scan_ms = scan_ms_sum / n_queries as f64;
@@ -343,11 +434,7 @@ pub fn run_retrieval_bench(
 
     Ok(RetrievalBenchReport {
         label: label.into(),
-        corpus: format!(
-            "{} / {}",
-            data.manifest.dataset,
-            data_dir.display()
-        ),
+        corpus: format!("{} / {}", data.manifest.dataset, data_dir.display()),
         model: data.manifest.model.clone(),
         scale: data.manifest.scale.clone(),
         mrl: true,
@@ -356,6 +443,7 @@ pub fn run_retrieval_bench(
         dims,
         shortlist,
         strata: strata_name(strata),
+        corpus_mmap: true,
         shortlist_coverage_at_10: coverage10 / n_queries as f64,
         reranked_recall_at_10: rerank10 / n_queries as f64,
         reranked_recall_at_100: rerank100 / n_queries as f64,
@@ -375,11 +463,12 @@ impl RetrievalBenchReport {
     pub fn print_summary(&self) {
         println!("=== mrl-index retrieval bench [{}] ===", self.label);
         println!(
-            "corpus: {}  scale={}  model={}  mrl={}",
+            "corpus: {}  scale={}  model={}  mrl={}  mmap={}",
             self.corpus,
             self.scale.as_deref().unwrap_or("-"),
             self.model,
-            self.mrl
+            self.mrl,
+            self.corpus_mmap
         );
         println!(
             "scan: n={} q={} dims={} shortlist={} strata={}",
