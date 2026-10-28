@@ -91,3 +91,35 @@ fn reopen_preserves_search() {
     let result = engine.query("orbital mechanics").unwrap();
     assert!(!result.hits.is_empty());
 }
+
+#[test]
+fn binary_passage_store_roundtrip_and_batch_order() {
+    use mrl_index::{PassageRecord, PassageStore};
+
+    let dir = tempdir().unwrap();
+    let mut store = PassageStore::open(dir.path()).unwrap();
+    for i in 0..10u64 {
+        store
+            .append(PassageRecord {
+                id: 0,
+                text: format!("passage-{i} with quotes \"and\"\nnewlines"),
+                timestamp: 100 + i as u32,
+                source: source::CODE,
+                meta: serde_json::json!({"ord": i}),
+            })
+            .unwrap();
+    }
+    store.flush().unwrap();
+
+    let rec = store.fetch_record(3).unwrap();
+    assert_eq!(rec.id, 3);
+    assert_eq!(rec.timestamp, 103);
+    assert_eq!(rec.text, "passage-3 with quotes \"and\"\nnewlines");
+    assert_eq!(rec.meta["ord"], 3);
+
+    // Reverse ID order ensures LBA-sorted fetch_many restores caller order.
+    let batch = store.fetch_many(&[8, 2, 5, 0]).unwrap();
+    let ids: Vec<u64> = batch.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![8, 2, 5, 0]);
+    assert!(batch[1].1.starts_with("passage-2 "));
+}

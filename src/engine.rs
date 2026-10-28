@@ -12,7 +12,7 @@ use crate::embed::HashingEmbedder;
 use crate::passage::{PassageRecord, PassageStore};
 use crate::rerank::{rerank_batch, Embedder, RerankHit};
 use crate::ring::{PendingVector, RingBuffer};
-use crate::scan::{scan_block, QueryPlan, Shortlist};
+use crate::scan::{scan_block, scan_blocks, QueryPlan, Shortlist};
 use crate::segment::{SegmentReader, SegmentWriter};
 
 #[derive(Debug, thiserror::Error)]
@@ -213,7 +213,7 @@ impl IndexEngine {
         };
 
         if let Some(block) = maybe_block {
-            self.commit_block(block)?;
+            self.commit_block_inner(block, true)?;
         }
         Ok(id)
     }
@@ -223,13 +223,58 @@ impl IndexEngine {
         items: &[(String, u32, u32)],
     ) -> Result<Vec<u64>, EngineError> {
         let mut ids = Vec::with_capacity(items.len());
-        for (text, ts, src) in items {
-            ids.push(self.ingest(text.clone(), *ts, *src)?);
+        let batch_sz = self.config.jit_batch_size.max(64);
+        let mut committed_any = false;
+
+        for chunk in items.chunks(batch_sz) {
+            let texts: Vec<String> = chunk.iter().map(|(t, _, _)| t.clone()).collect();
+            let embeds = self.embedder.embed(&texts);
+            for ((text, ts, src_raw), embedding) in chunk.iter().zip(embeds.into_iter()) {
+                let src = if *src_raw == 0 {
+                    source::DOC
+                } else {
+                    *src_raw
+                };
+                let id = self.passages.append(PassageRecord {
+                    id: 0,
+                    text: text.clone(),
+                    timestamp: *ts,
+                    source: src,
+                    meta: serde_json::Value::Null,
+                })?;
+                ids.push(id);
+
+                let pending = PendingVector {
+                    passage_id: id,
+                    embedding,
+                    timestamp: *ts,
+                    source: src,
+                    text: text.clone(),
+                };
+                let maybe_block = {
+                    let mut ring = self.ring.lock();
+                    ring.push(pending)
+                };
+                if let Some(block) = maybe_block {
+                    self.commit_block_inner(block, false)?;
+                    committed_any = true;
+                }
+            }
+        }
+
+        if committed_any {
+            self.passages.flush()?;
+            let blocks_written = self.segment_writer.lock().block_count();
+            self.write_manifest(blocks_written)?;
         }
         Ok(ids)
     }
 
-    fn commit_block(&mut self, block: crate::block::PaxBlock64) -> Result<(), EngineError> {
+    fn commit_block_inner(
+        &mut self,
+        block: crate::block::PaxBlock64,
+        sync_metadata: bool,
+    ) -> Result<(), EngineError> {
         let active = block.active_count() as usize;
         // Passage ids for this block are the last `active` passages written.
         let end = self.passages.len();
@@ -253,7 +298,10 @@ impl IndexEngine {
 
         // O(1) live append — do not remap/recopy the whole segment (was O(N²)).
         self.segment_reader.append_live(block);
-        self.write_manifest(blocks_written)?;
+        if sync_metadata {
+            self.passages.flush()?;
+            self.write_manifest(blocks_written)?;
+        }
         Ok(())
     }
 
@@ -264,7 +312,11 @@ impl IndexEngine {
             ring.flush_partial()
         };
         if let Some(block) = block {
-            self.commit_block(block)?;
+            self.commit_block_inner(block, true)?;
+        } else {
+            self.passages.flush()?;
+            let blocks_written = self.segment_writer.lock().block_count();
+            self.write_manifest(blocks_written)?;
         }
         Ok(())
     }
@@ -289,17 +341,24 @@ impl IndexEngine {
         let plan = QueryPlan::from_query(query, self.config.embed_dims);
         let mut shortlist = Shortlist::new(self.config.shortlist_cand);
         let n_blocks = self.segment_reader.block_count();
-        for i in 0..n_blocks {
-            if let Some(block) = self.segment_reader.block(i) {
-                scan_block(
-                    block,
-                    i as u32,
-                    &plan,
-                    &self.config,
-                    &mut shortlist,
-                    time_lo,
-                    time_hi,
-                );
+
+        if let Some(blocks) = self.segment_reader.as_slice() {
+            for hit in scan_blocks(blocks, &plan, &self.config, time_lo, time_hi) {
+                shortlist.push(hit);
+            }
+        } else {
+            for i in 0..n_blocks {
+                if let Some(block) = self.segment_reader.block(i) {
+                    scan_block(
+                        block,
+                        i as u32,
+                        &plan,
+                        &self.config,
+                        &mut shortlist,
+                        time_lo,
+                        time_hi,
+                    );
+                }
             }
         }
 
@@ -324,6 +383,9 @@ impl IndexEngine {
         let ring = self.ring.lock();
 
         let mut candidates: Vec<(u64, String, f32)> = Vec::with_capacity(scanned.len());
+        let mut disk_pids: Vec<u64> = Vec::with_capacity(scanned.len());
+        let mut disk_scores: Vec<f32> = Vec::with_capacity(scanned.len());
+
         for hit in &scanned {
             if hit.id.block == u32::MAX {
                 if let Some(p) = ring.pending.get(hit.id.slot as usize) {
@@ -338,12 +400,19 @@ impl IndexEngine {
             if pid == u64::MAX {
                 continue;
             }
-            if let Ok(text) = self.passages.fetch_text(pid) {
-                candidates.push((pid, text, hit.score));
-            }
+            disk_pids.push(pid);
+            disk_scores.push(hit.score);
         }
         drop(ring);
         drop(id_map);
+
+        if !disk_pids.is_empty() {
+            if let Ok(fetched) = self.passages.fetch_many(&disk_pids) {
+                for ((pid, text), score) in fetched.into_iter().zip(disk_scores.into_iter()) {
+                    candidates.push((pid, text, score));
+                }
+            }
+        }
         let fetch_ms = t_fetch.elapsed().as_secs_f64() * 1000.0;
 
         let t_rr = Instant::now();
