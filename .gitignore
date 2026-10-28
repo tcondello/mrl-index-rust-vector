@@ -6,3 +6,8 @@ data/sec10k_mrl/manifest.json
 __pycache__/
 .venv/
 .modal/
+
+# Large generated benchmark artifacts (download from Hub / Modal)
+data/msmarco_gemma2/*/
+!data/msmarco_gemma2/README.md
+data/msmarco_gemma2/full_modal_salvage/
