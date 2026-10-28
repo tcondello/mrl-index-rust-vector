@@ -232,21 +232,17 @@ def prepare_corpus(scale: str = "1m", seed: int = SEED) -> dict[str, Any]:
     # Always include every qrels-relevant doc; fill the rest with deterministic distractors.
     # Full scale: keep every passage in original corpus order.
     print("selecting corpus indices…")
+    # Column extract is far faster than per-row __getitem__ over 8.8M passages.
+    print("materializing corpus columns (_id, title, text)…")
+    all_ids = [str(x) for x in corpus_ds["_id"]]
+    all_titles = [("" if x is None else str(x)).strip() for x in corpus_ds["title"]]
+    all_texts = [("" if x is None else str(x)).strip() for x in corpus_ds["text"]]
+    print(f"  columns ready n={len(all_ids)}")
+
     if target_n == n_total:
         selected_src_indices = list(range(n_total))
-        # Dense row order = original corpus order for full scale.
-        chosen_ids_in_order: list[str] = []
-        for i in range(n_total):
-            chosen_ids_in_order.append(str(corpus_ds[i]["_id"]))
-            if (i + 1) % 1_000_000 == 0:
-                print(f"  read ids {i+1}/{n_total}")
     else:
-        # Map id -> source index (one linear pass).
-        id_to_idx: dict[str, int] = {}
-        for i in range(n_total):
-            id_to_idx[str(corpus_ds[i]["_id"])] = i
-            if (i + 1) % 1_000_000 == 0:
-                print(f"  indexed {i+1}/{n_total}")
+        id_to_idx = {cid: i for i, cid in enumerate(all_ids)}
         missing_docs = [d for d in relevant_ids if d not in id_to_idx]
         if missing_docs:
             raise RuntimeError(f"{len(missing_docs)} qrels corpus ids missing from corpus")
@@ -266,12 +262,16 @@ def prepare_corpus(scale: str = "1m", seed: int = SEED) -> dict[str, Any]:
             if len(selected_src_indices) >= target_n:
                 break
         assert len(selected_src_indices) == target_n
-        chosen_ids_in_order = [str(corpus_ds[i]["_id"]) for i in selected_src_indices]
 
+    chosen_ids_in_order = [all_ids[i] for i in selected_src_indices]
     corpus_id_to_row = {cid: i for i, cid in enumerate(chosen_ids_in_order)}
 
     # Materialize selected corpus rows into shard parquet (text only; embeddings later).
     shards_dir = out / "text_shards"
+    if shards_dir.exists():
+        # Fresh prepare for this scale — drop stale text shards.
+        for p in shards_dir.glob("*.parquet"):
+            p.unlink()
     shards_dir.mkdir(parents=True, exist_ok=True)
     n_shards = math.ceil(target_n / SHARD_SIZE)
     shard_paths: list[str] = []
@@ -279,20 +279,12 @@ def prepare_corpus(scale: str = "1m", seed: int = SEED) -> dict[str, Any]:
     for s in range(n_shards):
         start = s * SHARD_SIZE
         end = min(start + SHARD_SIZE, target_n)
-        row_ids: list[int] = []
-        corpus_ids: list[str] = []
-        titles: list[str] = []
-        texts: list[str] = []
-        flags: list[bool] = []
-        for row_id in range(start, end):
-            src_i = selected_src_indices[row_id]
-            src = corpus_ds[src_i]
-            cid = str(src["_id"])
-            row_ids.append(row_id)
-            corpus_ids.append(cid)
-            titles.append((src.get("title") or "").strip())
-            texts.append((src.get("text") or "").strip())
-            flags.append(cid in relevant_set)
+        src_indices = selected_src_indices[start:end]
+        row_ids = list(range(start, end))
+        corpus_ids = [all_ids[i] for i in src_indices]
+        titles = [all_titles[i] for i in src_indices]
+        texts = [all_texts[i] for i in src_indices]
+        flags = [cid in relevant_set for cid in corpus_ids]
         path = shards_dir / f"shard_{s:05d}.parquet"
         table = pa.table(
             {
@@ -306,6 +298,8 @@ def prepare_corpus(scale: str = "1m", seed: int = SEED) -> dict[str, Any]:
         pq.write_table(table, path, compression="zstd")
         shard_paths.append(str(path))
         print(f"  wrote {path.name} rows={end-start}")
+    # Free column buffers before returning.
+    del all_ids, all_titles, all_texts, selected_src_indices
 
     # Remap qrels to dense row ids; drop pairs whose docs somehow missing (shouldn't happen).
     qrels_mapped = []
@@ -503,10 +497,20 @@ def compute_neighbors(scale: str, k_max: int = K_MAX) -> dict[str, Any]:
     n = int(prepare["n_corpus"])
     n_shards = int(prepare["n_shards"])
     corpus = np.zeros((n, EMBED_DIMS), dtype=np.float32)
+
+    def _fixed_list_to_numpy(col) -> np.ndarray:
+        chunked = col.combine_chunks()
+        # FixedSizeListArray → flat values then reshape.
+        flat = chunked.values.to_numpy(zero_copy_only=False)
+        return np.asarray(flat, dtype=np.float32).reshape(len(chunked), EMBED_DIMS)
+
     for s in range(n_shards):
-        shard = pq.read_table(out / "emb_shards" / f"shard_{s:05d}.parquet", columns=["row_id", "embedding"])
+        shard = pq.read_table(
+            out / "emb_shards" / f"shard_{s:05d}.parquet",
+            columns=["row_id", "embedding"],
+        )
         row_ids = shard.column("row_id").to_numpy()
-        emb = np.asarray(shard.column("embedding").to_pylist(), dtype=np.float32)
+        emb = _fixed_list_to_numpy(shard.column("embedding"))
         corpus[row_ids] = emb
         print(f"loaded emb shard {s}/{n_shards}")
 
