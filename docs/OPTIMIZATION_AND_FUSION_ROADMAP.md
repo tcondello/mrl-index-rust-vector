@@ -26,14 +26,15 @@ Each optimization step below is self-contained, measurable via `bench-suite`, an
 
 ```mermaid
 flowchart TD
-    S1["Step 1: Algorithmic Calibration (Done in main)\nFWHT 128-d Rotation + Calibrated RaBitQ Scale + Full 4-Bit Prefix"]
-    S2["Step 2: CPU SWAR/SIMD & Storage Engine (Done in opt/swar-simd-binary-store)\nSWAR 4-Bit Unpack + Single-Pass S1 + Rayon Sharding + Binary pread Store"]
-    S3["Step 3: Fixed 768-d Geometry & Bit-Budget Reclamation\nFold 576-d Tail into Stratum 4 + Mid/Tail Norm Ratio in VectorMeta::flags + Unrolled dot_768"]
-    S4["Step 4: Low-Precision Pipeline (fp16 / int8)\n[f16; 768] RingBuffer & Rerank + NEON vfmaq_f16 / vdotq_s32 + 4-bit/8-bit Model Weights"]
-    S5["Step 5: Storage-Level Model Fusion\nPre-Tokenized u16 Spans in passages.bin + 16 KiB Page Alignment for Metal Zero-Copy"]
-    S6["Step 6: Operator-Level & Kernel-Level Model Fusion (Apple Silicon Metal / MLX / ANE)\nFold FWHT into Model Projection Weights + Fused Metal simd_ballot & Rerank Epilogue"]
+    S1["Step 1: Algorithmic Calibration (Done)\nFWHT + RaBitQ scale + full 4-bit prefix"]
+    S2["Step 2: SWAR/SIMD + Rayon + passages.bin (Done)\n~8× MS MARCO scan; Mac 13× microbench"]
+    S25["Step 2.5: Shortlist calibration (Done)\nsl64→1024; 8.8M ANN 0.60→0.89"]
+    S3["Step 3: Fold 576-d tail into stratum4 (Next)\nReclaim unused 512 B; unrolled dot_768"]
+    S4["Step 4: fp16 / int8 pipeline"]
+    S5["Step 5: passages.bin v2 tokens + 16 KiB pages"]
+    S6["Step 6: Metal / MLX / ANE kernel fusion"]
 
-    S1 --> S2 --> S3 --> S4 --> S5 --> S6
+    S1 --> S2 --> S25 --> S3 --> S4 --> S5 --> S6
 ```
 
 ---
@@ -59,11 +60,34 @@ flowchart TD
   * **131K Vector Scan**: `25.86 ms` (`5.1 Mvecs/s`) $\to$ **`1.93 ms` (`67.7 Mvecs/s`, $13.4\times$ faster)**
   * **64-Candidate Text Fetch**: `1.08 ms` $\to$ **`0.03 ms` ($36\times$ faster)**
   * **Ingest Throughput**: `162K docs/s` $\to$ **`596K docs/s` ($3.7\times$ faster)**
+* **Measured Impact (Cloud Linux, MS MARCO + EmbeddingGemma-2 @768, mmap corpus)**:
+  * **1M scan**: `183.8 ms/q` $\to$ **`23.6 ms/q`** ($7.8\times$, `5.4 \to 42.3$ Mvecs/s) — quality bit-identical
+  * **8.8M scan**: `1734.8 ms/q` $\to$ **`208.6 ms/q`** ($8.3\times$, `5.1 \to 42.4$ Mvecs/s) — quality bit-identical
+  * Rayon encode of 8.8M PaxBlocks: ~55 s $\to$ ~38 s
 
 ---
 
-### Step 3: Fixed 768-d Geometry & Bit-Budget Reclamation (`EMBED_DIMS = 768`)
+### Step 2.5: Shortlist Calibration for Gemma2 @768 *(Completed)*
+* **Objective**: Stop confusing undersized shortlist with weak bitplane ranking.
+* **Finding**: On EmbeddingGemma-2, `reranked R@10 == shortlist_cov@10` at every shortlist size → coverage is the bottleneck. Design SEC benches used shortlist **128**; early MS MARCO runs used **64**.
+* **Changes**: Raised `shortlist_cand` max to `4096`; `bench-retrieval` default **256**; quality ops use **1024**.
+* **Measured Impact (8.8M, L1)**:
+
+  | Shortlist | ANN R@10 | qrels R@10 | qrels nDCG@10 |
+  |-----------|----------|------------|---------------|
+  | 64 | 0.597 | 0.431 | 0.286 |
+  | **1024** | **0.887** | **0.522** | **0.330** |
+  | embedding oracle | 1.000 | 0.547 | — |
+
+  At shortlist 1024, qrels R@10 is **~95% of the EmbeddingGemma oracle** on full MS MARCO. Remaining IR gap is model/corpus, not scan kernel. See `bench_results/QUALITY_ANALYSIS.md`.
+
+* **Why Step 3 still matters**: Even at shortlist 1024, ANN R@10 is **0.89 not ~0.98**. Tail dims `192..768` are currently discarded by the sketch — reclaiming them into `stratum4_mid` is the next lever to shrink shortlist for the same recall (and cut rerank cost).
+
+---
+
+### Step 3: Fixed 768-d Geometry & Bit-Budget Reclamation (`EMBED_DIMS = 768`) *(Next)*
 * **Objective**: Exploit the exact $768 = 12 \times 64 = 24 \times 32$ geometry to cover all 768 dimensions inside `PaxBlock64` and unroll all vector math at compile time.
+* **Success metric (MS MARCO full)**: Match or beat shortlist-1024 ANN R@10 (**≥ 0.887**) at shortlist **≤ 256**, and/or raise ANN R@10 at shortlist 1024 toward **≥ 0.95**.
 * **Changes**:
   1. **Fold the 576-d Tail (`192..768`) into `stratum4_mid` (`512 B`)**:
      * Currently, `stratum4_mid` (`64 × u64`) is written on encode and ignored on scan, while dims `192..768` ($9 \times 64$ dims) are discarded.
