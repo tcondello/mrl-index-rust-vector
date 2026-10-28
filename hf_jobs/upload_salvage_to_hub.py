@@ -49,19 +49,28 @@ def main() -> None:
         )
 
     print(f"uploading {args.local} → {args.repo}")
-    # upload_large_folder is preferred for many/large files
-    if hasattr(api, "upload_large_folder"):
-        api.upload_large_folder(
-            folder_path=str(args.local),
-            repo_id=args.repo,
-            repo_type="dataset",
-        )
-    else:
+    # Upload subfolders separately so a failure can resume without redoing everything.
+    for sub in ("meta", "text_shards", "emb_shards"):
+        src = args.local / sub
+        if not src.exists():
+            print(f"skip missing {src}")
+            continue
+        print(f"→ {sub}/")
         api.upload_folder(
-            folder_path=str(args.local),
+            folder_path=str(src),
+            path_in_repo=sub,
             repo_id=args.repo,
             repo_type="dataset",
-            multi_commits=True,
+            commit_message=f"Add/update {sub} for MS MARCO Gemma2 full work",
+        )
+    readme_path = args.local / "README.md"
+    if readme_path.exists():
+        api.upload_file(
+            path_or_fileobj=str(readme_path),
+            path_in_repo="README.md",
+            repo_id=args.repo,
+            repo_type="dataset",
+            commit_message="Add dataset card",
         )
     print("upload complete")
 
