@@ -123,7 +123,7 @@ def main() -> None:
         script_args=["--work-repo", args.work_repo, "--out-repo", args.out_repo],
         flavor=args.finalize_flavor,
         timeout=args.finalize_timeout,
-        secrets=["HF_TOKEN"],
+        secrets={"HF_TOKEN": token},
         name="msmarco-gemma2-finalize",
     )
     print(f"finalize job: {final.id} {getattr(final, 'url', '')}")
