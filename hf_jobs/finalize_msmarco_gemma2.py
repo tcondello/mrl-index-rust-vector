@@ -121,9 +121,10 @@ def main() -> None:
     texts = qtext.column("text").to_pylist()
     print(f"embedding {len(texts)} queries…")
     model = load_model()
+    # Bake query instruction into the string to avoid multimodal URL/image fetch.
+    q_inputs = [f"task: search result | query: {t}" for t in texts]
     emb = model.encode(
-        texts,
-        prompt_name="Retrieval-query",
+        q_inputs,
         batch_size=QUERY_BATCH,
         convert_to_numpy=True,
         normalize_embeddings=True,

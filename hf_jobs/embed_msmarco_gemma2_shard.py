@@ -55,32 +55,31 @@ def load_model():
 
 
 def encode_documents(model, titles: list[str], texts: list[str]):
+    """Encode docs as plain text.
+
+    Important: do **not** pass `prompt=` into multimodal EmbeddingGemma-2 for
+    raw MS MARCO passages — URLs in the text get treated as images to fetch.
+    Bake the retrieval document instruction into the string instead.
+    """
     import numpy as np
 
-    prompts = [f"title: {t.strip() or 'none'} | text: " for t in titles]
-    out = np.zeros((len(texts), EMBED_DIMS), dtype=np.float32)
-    i = 0
-    while i < len(texts):
-        j = min(i + DOC_BATCH, len(texts))
-        k = i + 1
-        while k < j and prompts[k] == prompts[i]:
-            k += 1
-        emb = model.encode(
-            texts[i:k],
-            prompt=prompts[i],
-            batch_size=DOC_BATCH,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-        arr = np.asarray(emb, dtype=np.float32)
-        if arr.shape[1] != EMBED_DIMS:
-            arr = arr[:, :EMBED_DIMS]
-            norms = np.linalg.norm(arr, axis=1, keepdims=True).clip(min=1e-12)
-            arr = arr / norms
-        out[i:k] = arr
-        i = k
-    return out
+    inputs = [
+        f"title: {(t or '').strip() or 'none'} | text: {x}"
+        for t, x in zip(titles, texts)
+    ]
+    emb = model.encode(
+        inputs,
+        batch_size=DOC_BATCH,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=True,
+    )
+    arr = np.asarray(emb, dtype=np.float32)
+    if arr.shape[1] != EMBED_DIMS:
+        arr = arr[:, :EMBED_DIMS]
+        norms = np.linalg.norm(arr, axis=1, keepdims=True).clip(min=1e-12)
+        arr = arr / norms
+    return arr
 
 
 def main() -> None:
