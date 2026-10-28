@@ -16,6 +16,7 @@ pub mod embed;
 pub mod engine;
 pub mod passage;
 pub mod quantize;
+pub mod retrieval_bench;
 pub mod rerank;
 pub mod ring;
 pub mod rotate;

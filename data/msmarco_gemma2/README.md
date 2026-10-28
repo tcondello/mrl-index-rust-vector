@@ -52,12 +52,39 @@ modal run modal/embed_msmarco_gemma2.py \
   --scale 1m --download-dir data/msmarco_gemma2/1m
 ```
 
+## Hub backup (canonical)
+
+| Suite | Dataset | Status |
+|-------|---------|--------|
+| smoke | [`astr010/msmarco-gemma2-smoke`](https://huggingface.co/datasets/astr010/msmarco-gemma2-smoke) | backed up |
+| 1m | [`astr010/msmarco-gemma2-1m`](https://huggingface.co/datasets/astr010/msmarco-gemma2-1m) | backed up |
+| full | [`astr010/msmarco-gemma2-full`](https://huggingface.co/datasets/astr010/msmarco-gemma2-full) | backed up |
+| full shards | [`astr010/msmarco-gemma2-full-work`](https://huggingface.co/datasets/astr010/msmarco-gemma2-full-work) | 177 emb shards |
+
+Local byte sizes for parquet + manifest match Hub for smoke / 1m / full.
+
 ## Validate
 
 ```bash
 pip install -r modal/requirements-bench-data.txt
 python3 scripts/validate_msmarco_bench.py data/msmarco_gemma2/1m
 ```
+
+## Clean retrieval bench (no shortcuts)
+
+Converts parquet → `*_bin/` (embeddings.bin + query emb + neighbors + qrels) and builds release:
+
+```bash
+scripts/prepare_clean_bench.sh          # smoke + 1m
+./target/release/mrl-index bench-retrieval \
+  --label 1m-clean --data data/msmarco_gemma2/1m_bin \
+  --shortlist 64 --strata l1_rabitq \
+  --out reports/bench_1m_clean.json
+```
+
+Clean means: separate query embeddings, exact neighbor GT, qrels IR metrics, full 768-d — never `--synthetic` / self-retrieval.
+
+Full (~8.8M × 768 ≈ 27 GiB embeddings) needs streaming/mmap before an in-RAM clean run.
 
 ## Ground truth layers
 
