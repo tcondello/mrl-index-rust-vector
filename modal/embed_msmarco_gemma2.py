@@ -48,10 +48,13 @@ GPU = "A100-40GB"
 Scale = Literal["smoke", "1m", "full"]
 
 SCALE_N: dict[str, int | None] = {
-    "smoke": 2_048,
+    # Must be >= #unique MS MARCO dev qrels docs (~7.4k), or use qrels subsample below.
+    "smoke": 8_192,
     "1m": 1_000_000,
     "full": None,  # entire corpus
 }
+# For tiny smokes, keep only this many qrels queries (0 = keep all).
+SMOKE_MAX_QUERIES = 128
 
 VOL = modal.Volume.from_name("mrl-index-msmarco-gemma2", create_if_missing=True)
 VOL_ROOT = Path("/vol/msmarco_gemma2")
@@ -184,6 +187,13 @@ def prepare_corpus(scale: str = "1m", seed: int = SEED) -> dict[str, Any]:
         }
         for r in qrels
     ]
+    rng = np.random.default_rng(seed)
+    if scale == "smoke" and SMOKE_MAX_QUERIES > 0:
+        all_q = sorted({r["query_id"] for r in qrels_rows})
+        keep_q = set(rng.choice(all_q, size=min(SMOKE_MAX_QUERIES, len(all_q)), replace=False).tolist())
+        qrels_rows = [r for r in qrels_rows if r["query_id"] in keep_q]
+        print(f"smoke: subsampled qrels to {len(keep_q)} queries ({len(qrels_rows)} pairs)")
+
     relevant_ids = sorted({r["corpus_id"] for r in qrels_rows})
     query_ids = sorted({r["query_id"] for r in qrels_rows})
     print(f"qrels: {len(qrels_rows)} pairs, {len(query_ids)} queries, {len(relevant_ids)} relevant docs")
@@ -215,7 +225,6 @@ def prepare_corpus(scale: str = "1m", seed: int = SEED) -> dict[str, Any]:
         )
 
     relevant_set = set(relevant_ids)
-    rng = np.random.default_rng(seed)
 
     # Decide which source indices to keep.
     # Always include every qrels-relevant doc; fill the rest with deterministic distractors.

@@ -4,7 +4,7 @@ Proper retrieval benchmark artifacts for `mrl-index` (not SEC self-retrieval).
 
 | Scale | Corpus size | Notes |
 |-------|-------------|--------|
-| `smoke` | 2,048 | CI / pipeline check |
+| `smoke` | 8,192 | Pipeline check (128 qrels queries subsampled) |
 | `1m` | 1,000,000 | All MS MARCO dev qrels docs + distractors |
 | `full` | 8,841,823 | Entire BeIR/msmarco passage corpus (no native 10M split) |
 
