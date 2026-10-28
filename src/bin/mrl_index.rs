@@ -80,6 +80,23 @@ enum Cmd {
         #[arg(long)]
         synthetic: bool,
     },
+    /// Clean MS MARCO retrieval bench: query emb + exact neighbors + qrels (no self-retrieval).
+    BenchRetrieval {
+        #[arg(long, default_value = "msmarco")]
+        label: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Binary bench dir from scripts/parquet_to_bench_bin.py
+        #[arg(long, default_value = "data/msmarco_gemma2/smoke_bin")]
+        data: PathBuf,
+        /// Cap queries (default: all in suite).
+        #[arg(long)]
+        queries: Option<usize>,
+        #[arg(long, default_value_t = 64)]
+        shortlist: usize,
+        #[arg(long, default_value = "l1_rabitq")]
+        strata: String,
+    },
 }
 
 fn parse_strata(s: &str) -> Result<StrataDepth> {
@@ -222,6 +239,37 @@ fn main() -> Result<()> {
                     )
                 })?
             };
+            report.print_summary();
+            if let Some(path) = out {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, report.to_json_pretty())?;
+                println!("wrote {}", path.display());
+            }
+        }
+        Cmd::BenchRetrieval {
+            label,
+            out,
+            data,
+            queries,
+            shortlist,
+            strata,
+        } => {
+            let strata = parse_strata(&strata)?;
+            let report = mrl_index::retrieval_bench::run_retrieval_bench(
+                &label,
+                &data,
+                queries,
+                shortlist,
+                strata,
+            )
+            .with_context(|| {
+                format!(
+                    "load retrieval bench from {} — run: python3 scripts/parquet_to_bench_bin.py <parquet_suite> <bin_dir>",
+                    data.display()
+                )
+            })?;
             report.print_summary();
             if let Some(path) = out {
                 if let Some(parent) = path.parent() {
