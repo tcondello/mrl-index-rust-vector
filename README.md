@@ -60,26 +60,31 @@ The default `HashingEmbedder` is a deterministic CPU stand-in so the full scan â
 
 ## Benchmarks (MRL embeddings required)
 
-The design assumes **Matryoshka** embeddings. The primary suite loads real MRL
-vectors for SEC 10-K chunks, generated on Modal:
+The design assumes **Matryoshka** embeddings. The preferred large-scale suite is
+**MS MARCO** embedded with **EmbeddingGemma 2** @ 768-d (parquet + dual ground truth):
 
 ```bash
 pip install -r modal/requirements.txt
-./scripts/check_modal_auth.sh   # MODAL_* in Cursor Environment secrets; start a new agent run
+./scripts/check_modal_auth.sh
+modal run modal/embed_msmarco_gemma2.py --scale 1m --download-dir data/msmarco_gemma2/1m
+modal run modal/embed_msmarco_gemma2.py --scale full --download-dir data/msmarco_gemma2/full
+python3 scripts/validate_msmarco_bench.py data/msmarco_gemma2/1m
+```
+
+- Dataset: [`BeIR/msmarco`](https://huggingface.co/datasets/BeIR/msmarco) + [`BeIR/msmarco-qrels`](https://huggingface.co/datasets/BeIR/msmarco-qrels)
+- Model: [`google/embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2) (768-d MRL)
+- Artifacts: `corpus` / `queries` / `qrels` / `neighbors` parquet â€” see `data/msmarco_gemma2/README.md`
+- Note: MS MARCO has **8.84M** passages (no native 10M split); `full` uses the entire corpus
+
+Legacy SEC 10-K @ nomic 384-d path (still supported by `bench-suite`):
+
+```bash
 modal run modal/embed_sec10k_mrl.py --limit 50000 --download-dir data/sec10k_mrl
-
-# or CPU fallback:
-pip install -r modal/requirements-embed.txt
-python3 scripts/embed_sec10k_local.py --limit 8192 --out data/sec10k_mrl
-
 cargo build --release
 ./target/release/mrl-index bench-suite \
   --embeddings data/sec10k_mrl \
   --out bench_results/mrl_sec10k.json
 ```
-
-- Dataset: [`astr010/sec-10k-lsh-chunks`](https://huggingface.co/datasets/astr010/sec-10k-lsh-chunks)
-- Model: [`nomic-ai/nomic-embed-text-v1.5`](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) (MRL, truncated to 384-d)
 
 Plumbing-only isotropic vectors (not an MRL evaluation):
 
