@@ -78,8 +78,10 @@ impl Default for EngineConfig {
 
 impl EngineConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if !(16..=256).contains(&self.shortlist_cand) {
-            return Err("shortlist_cand must be in [16, 256]".into());
+        // Upper bound raised for large-corpus MRL (EmbeddingGemma @768): shortlist
+        // 64–256 leaves substantial exact@10 on the table; 512–1024 recovers most of it.
+        if !(16..=4096).contains(&self.shortlist_cand) {
+            return Err("shortlist_cand must be in [16, 4096]".into());
         }
         if !(0.80..=1.20).contains(&self.cs_tolerance) {
             return Err("cs_tolerance must be in [0.80, 1.20]".into());

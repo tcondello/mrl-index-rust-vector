@@ -92,7 +92,9 @@ enum Cmd {
         /// Cap queries (default: all in suite).
         #[arg(long)]
         queries: Option<usize>,
-        #[arg(long, default_value_t = 64)]
+        /// Candidate shortlist before exact-IP rerank. 64 under-recalls on Gemma2@768;
+        /// 256–1024 is the quality operating range (see bench_results/ablation/).
+        #[arg(long, default_value_t = 256)]
         shortlist: usize,
         #[arg(long, default_value = "l1_rabitq")]
         strata: String,
