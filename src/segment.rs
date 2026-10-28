@@ -183,6 +183,15 @@ impl SegmentReader {
         PaxBlock64::from_bytes(&mmap[start..start + BLOCK_BYTES])
     }
 
+    /// Contiguous slice of blocks when backed by `owned` or 4 KiB-aligned `mmap`.
+    pub fn as_slice(&self) -> Option<&[PaxBlock64]> {
+        if !self.owned.is_empty() {
+            return Some(&self.owned);
+        }
+        let mmap = self.mmap.as_ref()?;
+        bytemuck::try_cast_slice(&mmap[..]).ok()
+    }
+
     pub fn for_each_block(&self, mut f: impl FnMut(u32, &PaxBlock64)) {
         let n = self.block_count();
         for i in 0..n {

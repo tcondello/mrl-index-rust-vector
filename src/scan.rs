@@ -6,6 +6,8 @@
 //! best available reconstruction for the configured depth. Using MSB-only for
 //! ranking collapses shortlist recall (≈7% coverage of exact@10 on nomic MRL).
 
+use rayon::prelude::*;
+
 use crate::block::{
     PaxBlock64, VectorId, MRL_PREFIX_DIMS, RABITQ_DIMS, VECTORS_PER_BLOCK,
 };
@@ -21,6 +23,12 @@ pub struct QueryPlan {
     pub bit_weights: [[f32; 4]; MRL_PREFIX_DIMS],
     pub rabitq_q: [f32; RABITQ_DIMS],
     pub rabitq_scale: f32,
+    /// `2.0 * rabitq_q[d] * rabitq_scale` for single-pass bit=1 accumulation.
+    pub rabitq_weights2: [f32; RABITQ_DIMS],
+    /// `- Σ_d rabitq_q[d] * rabitq_scale` baseline when all bits are 0.
+    pub rabitq_base: f32,
+    /// 4-dim LUTs for dense Stratum-1 evaluation (`32 × 16` floats = 2 KiB).
+    pub rabitq_lut: [[f32; 16]; RABITQ_DIMS / 4],
     pub mid_prefix: [f32; MRL_PREFIX_DIMS],
     pub q_tail_norm: f32,
     /// ‖q[64..]‖₂ — remainder after leading 64 dims.
@@ -28,6 +36,8 @@ pub struct QueryPlan {
     pub q_after_s1: f32,
     /// Σ |q_d| over prefix — for bitplane residual slack.
     pub prefix_l1: f32,
+    /// Σ q_d over prefix — for O(1) affine offset dot product.
+    pub prefix_sum: f32,
 }
 
 impl QueryPlan {
@@ -40,9 +50,11 @@ impl QueryPlan {
 
         let mut bit_weights = [[0.0f32; 4]; MRL_PREFIX_DIMS];
         let mut prefix_l1 = 0.0f32;
+        let mut prefix_sum = 0.0f32;
         for d in 0..MRL_PREFIX_DIMS {
             let q = prefix[d];
             prefix_l1 += q.abs();
+            prefix_sum += q;
             bit_weights[d][0] = q * 1.0;
             bit_weights[d][1] = q * 2.0;
             bit_weights[d][2] = q * 4.0;
@@ -52,6 +64,29 @@ impl QueryPlan {
         let mid = &query[MRL_PREFIX_DIMS..MRL_PREFIX_DIMS + RABITQ_DIMS];
         let rabitq_q = rotate_mid_band(mid);
         let rabitq_scale = rabitq_bit_scale();
+
+        let mut rabitq_weights2 = [0.0f32; RABITQ_DIMS];
+        let mut rabitq_base = 0.0f32;
+        for d in 0..RABITQ_DIMS {
+            let pos = rabitq_q[d] * rabitq_scale;
+            rabitq_base -= pos;
+            rabitq_weights2[d] = 2.0 * pos;
+        }
+
+        let mut rabitq_lut = [[0.0f32; 16]; RABITQ_DIMS / 4];
+        for g in 0..(RABITQ_DIMS / 4) {
+            let p0 = rabitq_q[4 * g] * rabitq_scale;
+            let p1 = rabitq_q[4 * g + 1] * rabitq_scale;
+            let p2 = rabitq_q[4 * g + 2] * rabitq_scale;
+            let p3 = rabitq_q[4 * g + 3] * rabitq_scale;
+            for mask in 0..16usize {
+                let s0 = if (mask & 1) != 0 { p0 } else { -p0 };
+                let s1 = if (mask & 2) != 0 { p1 } else { -p1 };
+                let s2 = if (mask & 4) != 0 { p2 } else { -p2 };
+                let s3 = if (mask & 8) != 0 { p3 } else { -p3 };
+                rabitq_lut[g][mask] = s0 + s1 + s2 + s3;
+            }
+        }
 
         let mut mid_prefix = [0.0f32; MRL_PREFIX_DIMS];
         mid_prefix.copy_from_slice(&query[MRL_PREFIX_DIMS..MRL_PREFIX_DIMS + MRL_PREFIX_DIMS]);
@@ -74,11 +109,15 @@ impl QueryPlan {
             bit_weights,
             rabitq_q,
             rabitq_scale,
+            rabitq_weights2,
+            rabitq_base,
+            rabitq_lut,
             mid_prefix,
             q_tail_norm,
             q_after_prefix,
             q_after_s1: q_tail_norm,
             prefix_l1,
+            prefix_sum,
         }
     }
 }
@@ -89,10 +128,14 @@ pub struct ScoredHit {
     pub score: f32,
 }
 
-/// Fixed-capacity min-heap of the best `capacity` scores (keeps highest).
+/// Fixed-capacity top-K tracker with cached O(1) minimum threshold.
+#[derive(Debug, Clone)]
 pub struct Shortlist {
     capacity: usize,
     heap: Vec<ScoredHit>,
+    min_idx: usize,
+    min_score: f32,
+    floor_tau: f32,
 }
 
 impl Shortlist {
@@ -100,34 +143,68 @@ impl Shortlist {
         Self {
             capacity: capacity.max(1),
             heap: Vec::with_capacity(capacity),
+            min_idx: 0,
+            min_score: f32::INFINITY,
+            floor_tau: f32::NEG_INFINITY,
         }
     }
 
+    pub fn with_floor(capacity: usize, floor_tau: f32) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            heap: Vec::with_capacity(capacity),
+            min_idx: 0,
+            min_score: f32::INFINITY,
+            floor_tau,
+        }
+    }
+
+    #[inline]
     pub fn threshold(&self) -> f32 {
         if self.heap.len() < self.capacity {
-            f32::NEG_INFINITY
+            self.floor_tau
         } else {
-            self.heap
-                .iter()
-                .map(|h| h.score)
-                .fold(f32::INFINITY, f32::min)
+            self.min_score.max(self.floor_tau)
         }
     }
 
+    #[inline]
     pub fn push(&mut self, hit: ScoredHit) {
+        if hit.score < self.floor_tau {
+            return;
+        }
         if self.heap.len() < self.capacity {
+            let idx = self.heap.len();
+            if hit.score < self.min_score {
+                self.min_score = hit.score;
+                self.min_idx = idx;
+            }
             self.heap.push(hit);
             return;
         }
-        if let Some((idx, worst)) = self
-            .heap
-            .iter()
-            .enumerate()
-            .min_by(|a, b| a.1.score.partial_cmp(&b.1.score).unwrap())
-        {
-            if hit.score > worst.score {
-                self.heap[idx] = hit;
+        if hit.score > self.min_score {
+            self.heap[self.min_idx] = hit;
+            self.recompute_min();
+        }
+    }
+
+    #[inline]
+    fn recompute_min(&mut self) {
+        let mut min_idx = 0;
+        let mut min_score = f32::INFINITY;
+        for (i, h) in self.heap.iter().enumerate() {
+            if h.score < min_score {
+                min_score = h.score;
+                min_idx = i;
             }
+        }
+        self.min_idx = min_idx;
+        self.min_score = min_score;
+    }
+
+    pub fn merge(&mut self, other: &Shortlist) {
+        for &hit in &other.heap {
+            self.push(hit);
         }
     }
 
@@ -155,6 +232,9 @@ fn accum_plane(plane: u64, live: u64, weight: f32, scores: &mut [f32; VECTORS_PE
         bits &= bits - 1;
     }
 }
+
+/// SWAR 4-bit nibble unpack mask (selects 1 bit per byte across 8 bytes).
+const SWAR_M8: u64 = 0x0101_0101_0101_0101;
 
 /// Scan one PaxBlock64; push survivors into `shortlist`.
 pub fn scan_block(
@@ -186,43 +266,66 @@ pub fn scan_block(
         return;
     }
 
-    // --- Reconstruct 4-bit codes · q  (code contribution; scale applied per vec) ---
-    // Always use all four bitplanes for ranking quality. StrataDepth only gates
-    // how much mid-band / refinement we add and how tight CS pruning is.
-    let mut code_dot = [0.0f32; VECTORS_PER_BLOCK];
-    for d in 0..MRL_PREFIX_DIMS {
-        // bit3 MSB (stratum 0), bit2 (s2), bit1 (s3), bit0 LSB (s5)
-        accum_plane(
-            block.stratum0_sign.dim_bits[d],
-            active,
-            plan.bit_weights[d][3],
-            &mut code_dot,
-        );
-        if !matches!(cfg.strata_depth, StrataDepth::L0Only) {
-            // Even L1_RABITQ must use full 4-bit for ranking — planes are on disk.
+    let mut scores = [0.0f32; VECTORS_PER_BLOCK];
+    let mut survivors = 0u64;
+
+    if matches!(cfg.strata_depth, StrataDepth::L0Only) {
+        let mut code_dot = [0.0f32; VECTORS_PER_BLOCK];
+        for d in 0..MRL_PREFIX_DIMS {
             accum_plane(
-                block.stratum2_msb1.dim_bits[d],
+                block.stratum0_sign.dim_bits[d],
                 active,
-                plan.bit_weights[d][2],
-                &mut code_dot,
-            );
-            accum_plane(
-                block.stratum3_msb2.dim_bits[d],
-                active,
-                plan.bit_weights[d][1],
-                &mut code_dot,
-            );
-            accum_plane(
-                block.stratum5_lsb.dim_bits[d],
-                active,
-                plan.bit_weights[d][0],
+                plan.bit_weights[d][3],
                 &mut code_dot,
             );
         }
+        for v in 0..VECTORS_PER_BLOCK {
+            let bit = 1u64 << v;
+            if active & bit == 0 {
+                continue;
+            }
+            let scale = block.meta[v].scale_f32();
+            let offset = block.meta[v].offset_f32();
+            let prefix_ip = code_dot[v] * scale + offset * plan.prefix_sum;
+            scores[v] = prefix_ip;
+
+            let x_rest = block.meta[v].tail_norm_f32().max(0.0);
+            let ub = prefix_ip + alpha * plan.q_after_prefix * x_rest;
+            if ub >= tau {
+                survivors |= bit;
+            }
+        }
+        if survivors != 0 {
+            finish_push(block_idx, survivors, &scores, shortlist);
+        }
+        return;
     }
 
-    let mut scores = [0.0f32; VECTORS_PER_BLOCK];
-    let mut survivors = 0u64;
+    // --- Branchless SWAR + SIMD 4-bit MRL prefix reconstruction (strata 0/2/3/5) ---
+    // `acc[s][k]` holds the unscaled 4-bit dot product for vector `v = 8 * k + s`.
+    let mut acc = [[0.0f32; 8]; 8];
+    for d in 0..MRL_PREFIX_DIMS {
+        let q = plan.prefix[d];
+        if q == 0.0 {
+            continue;
+        }
+        let b0 = block.stratum5_lsb.dim_bits[d];
+        let b1 = block.stratum3_msb2.dim_bits[d];
+        let b2 = block.stratum2_msb1.dim_bits[d];
+        let b3 = block.stratum0_sign.dim_bits[d];
+
+        for s in 0..8 {
+            let packed = ((b0 >> s) & SWAR_M8)
+                | (((b1 >> s) & SWAR_M8) << 1)
+                | (((b2 >> s) & SWAR_M8) << 2)
+                | (((b3 >> s) & SWAR_M8) << 3);
+            let bytes = packed.to_le_bytes();
+            for k in 0..8 {
+                acc[s][k] += (bytes[k] as f32) * q;
+            }
+        }
+    }
+
     for v in 0..VECTORS_PER_BLOCK {
         let bit = 1u64 << v;
         if active & bit == 0 {
@@ -230,11 +333,8 @@ pub fn scan_block(
         }
         let scale = block.meta[v].scale_f32();
         let offset = block.meta[v].offset_f32();
-        // q·(scale·code + offset·1) = scale·(q·code) + offset·Σq
-        let mut prefix_ip = code_dot[v] * scale;
-        for d in 0..MRL_PREFIX_DIMS {
-            prefix_ip += plan.prefix[d] * offset;
-        }
+        let code_dot_v = acc[v & 7][v >> 3];
+        let prefix_ip = code_dot_v * scale + offset * plan.prefix_sum;
         scores[v] = prefix_ip;
 
         // CS: prefix_ip + ‖q[64:]‖₂ ‖x[64:]‖₂ ≥ true IP.
@@ -249,44 +349,35 @@ pub fn scan_block(
         return;
     }
 
-    if matches!(cfg.strata_depth, StrataDepth::L0Only) {
-        finish_push(block_idx, survivors, &scores, shortlist);
-        return;
+    // --- Stratum 1: RaBitQ 1-bit mid-band (dims 64..191), IP-scaled ---
+    // Using identity: Σ (2*bit_d - 1)*pos_d = rabitq_base + Σ bit_d * (2*pos_d)
+    let mut s_bits = survivors;
+    while s_bits != 0 {
+        let v = s_bits.trailing_zeros() as usize;
+        scores[v] += plan.rabitq_base;
+        s_bits &= s_bits - 1;
     }
 
-    // --- Stratum 1: RaBitQ 1-bit mid-band (dims 64..191), IP-scaled ---
-    let alpha_bit = plan.rabitq_scale;
     for d in 0..RABITQ_DIMS {
-        let plane = block.stratum1_rabitq.dim_bits[d];
-        let q_rot = plan.rabitq_q[d];
-        let pos = q_rot * alpha_bit;
-        let neg = -pos;
-        let mut bits = plane & survivors;
+        let mut bits = block.stratum1_rabitq.dim_bits[d] & survivors;
+        let w = plan.rabitq_weights2[d];
         while bits != 0 {
             let v = bits.trailing_zeros() as usize;
-            scores[v] += pos;
-            bits &= bits - 1;
-        }
-        let mut bits = (!plane) & survivors;
-        while bits != 0 {
-            let v = bits.trailing_zeros() as usize;
-            scores[v] += neg;
+            scores[v] += w;
             bits &= bits - 1;
         }
     }
 
     // Post-S1: residual after prefix+mid is dims ≥ 192.
-    // We stored ‖x[64:]‖; conservative: allow full residual as UB slack.
     let mut survivors2 = 0u64;
-    for v in 0..VECTORS_PER_BLOCK {
-        let bit = 1u64 << v;
-        if survivors & bit == 0 {
-            continue;
-        }
+    let mut check_bits = survivors;
+    while check_bits != 0 {
+        let v = check_bits.trailing_zeros() as usize;
         let ub = scores[v] + alpha * plan.q_after_s1 * block.meta[v].tail_norm_f32();
         if ub >= tau {
-            survivors2 |= bit;
+            survivors2 |= 1u64 << v;
         }
+        check_bits &= check_bits - 1;
     }
     survivors = survivors2;
     if survivors == 0 {
@@ -321,7 +412,7 @@ fn finish_push(
     }
 }
 
-/// Scan a contiguous slice of blocks.
+/// Scan a contiguous slice of blocks (parallelized across Rayon shards when `numa_sharding` is enabled).
 pub fn scan_blocks(
     blocks: &[PaxBlock64],
     plan: &QueryPlan,
@@ -330,6 +421,57 @@ pub fn scan_blocks(
     time_hi: Option<u32>,
 ) -> Vec<ScoredHit> {
     let mut shortlist = Shortlist::new(cfg.shortlist_cand);
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+
+    // Parallel shard path when numa_sharding is enabled and block count warrants it.
+    const PAR_THRESHOLD: usize = 64;
+    if cfg.numa_sharding && blocks.len() >= PAR_THRESHOLD {
+        // Warm up initial threshold τ on the first few blocks so every parallel worker
+        // starts with an effective Cauchy–Schwarz pruning bound.
+        let warmup = (cfg.shortlist_cand / VECTORS_PER_BLOCK + 1).min(4).min(blocks.len());
+        for i in 0..warmup {
+            scan_block(
+                &blocks[i],
+                i as u32,
+                plan,
+                cfg,
+                &mut shortlist,
+                time_lo,
+                time_hi,
+            );
+        }
+        let rest = &blocks[warmup..];
+        let chunk_size = ((rest.len() + 7) / 8).max(16);
+        let floor_tau = shortlist.threshold();
+        let partials: Vec<Shortlist> = rest
+            .par_chunks(chunk_size)
+            .enumerate()
+            .map(|(ci, chunk)| {
+                let mut local = Shortlist::with_floor(cfg.shortlist_cand, floor_tau);
+                let base_idx = (warmup + ci * chunk_size) as u32;
+                for (j, block) in chunk.iter().enumerate() {
+                    scan_block(
+                        block,
+                        base_idx + j as u32,
+                        plan,
+                        cfg,
+                        &mut local,
+                        time_lo,
+                        time_hi,
+                    );
+                }
+                local
+            })
+            .collect();
+
+        for p in &partials {
+            shortlist.merge(p);
+        }
+        return shortlist.into_sorted();
+    }
+
     for (i, block) in blocks.iter().enumerate() {
         scan_block(
             block,
