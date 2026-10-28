@@ -1,0 +1,20 @@
+{
+  "label": "smoke-clean-768",
+  "corpus": "BeIR/msmarco / data/msmarco_gemma2/smoke_bin",
+  "model": "google/embeddinggemma-2",
+  "scale": "smoke",
+  "mrl": true,
+  "n_vectors": 8192,
+  "n_queries": 128,
+  "dims": 768,
+  "shortlist": 64,
+  "strata": "l1_rabitq",
+  "shortlist_coverage_at_10": 0.625,
+  "reranked_recall_at_10": 0.625,
+  "reranked_recall_at_100": 0.24343750000000003,
+  "qrels_recall_at_10": 0.97265625,
+  "qrels_ndcg_at_10": 0.9461195807309912,
+  "mean_scan_ms": 1.5844041171874992,
+  "mvecs_per_sec": 5.170398076560006,
+  "encode_ms": 20.419537000000002
+}
