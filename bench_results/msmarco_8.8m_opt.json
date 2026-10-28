@@ -1,0 +1,21 @@
+{
+  "label": "8.8m-opt-swar-simd",
+  "corpus": "BeIR/msmarco / data/msmarco_gemma2/full_bin",
+  "model": "google/embeddinggemma-2",
+  "scale": "full",
+  "mrl": true,
+  "n_vectors": 8841823,
+  "n_queries": 6980,
+  "dims": 768,
+  "shortlist": 64,
+  "strata": "l1_rabitq",
+  "corpus_mmap": true,
+  "shortlist_coverage_at_10": 0.5974212034383973,
+  "reranked_recall_at_10": 0.5974212034383973,
+  "reranked_recall_at_100": 0.22352578796561517,
+  "qrels_recall_at_10": 0.431279847182426,
+  "qrels_ndcg_at_10": 0.285516077839387,
+  "mean_scan_ms": 208.61161835286526,
+  "mvecs_per_sec": 42.3841350247526,
+  "encode_ms": 37989.184371
+}

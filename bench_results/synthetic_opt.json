@@ -1,0 +1,27 @@
+{
+  "label": "synthetic-opt",
+  "scan": {
+    "label": "synthetic-opt",
+    "corpus": "synthetic_isotropic_unit",
+    "mrl": false,
+    "model": null,
+    "n_vectors": 8192,
+    "n_queries": 32,
+    "dims": 384,
+    "shortlist": 64,
+    "strata": "l1_rabitq",
+    "shortlist_coverage_at_10": 0.31562499999999993,
+    "reranked_recall_at_10": 0.31562499999999993,
+    "scan_ranked_recall_at_10": 0.31562499999999993,
+    "mean_scan_ms": 0.5087045,
+    "mvecs_per_sec": 16.10365153050543
+  },
+  "ingest": {
+    "label": "synthetic-opt",
+    "n_docs": 4096,
+    "dims": 384,
+    "total_ms": 9.649536,
+    "docs_per_sec": 424476.36860466655,
+    "blocks_written": 64
+  }
+}
