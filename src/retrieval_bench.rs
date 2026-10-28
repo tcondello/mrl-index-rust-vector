@@ -257,26 +257,25 @@ fn read_f32_matrix(path: &Path, rows: usize, dims: usize) -> Result<Vec<f32>, Co
 }
 
 fn encode_corpus_mmap(emb: &MmapF32Matrix) -> Vec<PaxBlock64> {
+    use rayon::prelude::*;
+
     let n = emb.rows();
     let dims = emb.dims();
     let slice = emb.as_slice();
-    let mut blocks = Vec::with_capacity(n.div_ceil(VECTORS_PER_BLOCK));
-    let mut i = 0;
-    let report_every = (n / 20).max(VECTORS_PER_BLOCK * 1024);
-    while i < n {
-        let end = (i + VECTORS_PER_BLOCK).min(n);
-        let refs: Vec<&[f32]> = (i..end)
-            .map(|j| &slice[j * dims..(j + 1) * dims])
-            .collect();
-        let ts: Vec<u32> = (i..end).map(|j| j as u32).collect();
-        let src = vec![source::DOC; end - i];
-        blocks.push(encode_block(&refs, &ts, &src, dims));
-        i = end;
-        if i % report_every < VECTORS_PER_BLOCK || i == n {
-            eprintln!("  encode blocks {}/{} vecs", i, n);
-        }
-    }
-    blocks
+    let n_blocks = n.div_ceil(VECTORS_PER_BLOCK);
+    (0..n_blocks)
+        .into_par_iter()
+        .map(|bi| {
+            let start = bi * VECTORS_PER_BLOCK;
+            let end = (start + VECTORS_PER_BLOCK).min(n);
+            let refs: Vec<&[f32]> = (start..end)
+                .map(|j| &slice[j * dims..(j + 1) * dims])
+                .collect();
+            let ts: Vec<u32> = (start..end).map(|j| j as u32).collect();
+            let src = vec![source::DOC; end - start];
+            encode_block(&refs, &ts, &src, dims)
+        })
+        .collect()
 }
 
 fn hit_ids(hits: &[ScoredHit]) -> Vec<usize> {
