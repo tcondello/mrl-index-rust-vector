@@ -98,7 +98,7 @@ def main() -> None:
             script_args=["--repo", args.work_repo, "--shard-idx", str(idx)],
             flavor=args.flavor,
             timeout=args.timeout,
-            secrets=["HF_TOKEN"],
+            secrets={"HF_TOKEN": token},
             name=f"msmarco-gemma2-shard-{idx:05d}",
         )
         jobs.append(job)
