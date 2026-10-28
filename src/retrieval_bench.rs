@@ -9,7 +9,6 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::block::{source, PaxBlock64, VECTORS_PER_BLOCK};
@@ -194,24 +193,19 @@ fn read_f32_matrix(path: &Path, rows: usize, dims: usize) -> Result<Vec<f32>, Co
 }
 
 fn encode_corpus_flat(emb: &[f32], n: usize, dims: usize) -> Vec<PaxBlock64> {
-    let n_blocks = n.div_ceil(VECTORS_PER_BLOCK);
-    (0..n_blocks)
-        .into_par_iter()
-        .map(|b| {
-            let i = b * VECTORS_PER_BLOCK;
-            let end = (i + VECTORS_PER_BLOCK).min(n);
-            let mut refs: [&[f32]; VECTORS_PER_BLOCK] = [&[]; VECTORS_PER_BLOCK];
-            let mut ts = [0u32; VECTORS_PER_BLOCK];
-            let src = [source::DOC; VECTORS_PER_BLOCK];
-            let count = end - i;
-            for k in 0..count {
-                let j = i + k;
-                refs[k] = &emb[j * dims..(j + 1) * dims];
-                ts[k] = j as u32;
-            }
-            encode_block(&refs[..count], &ts[..count], &src[..count], dims)
-        })
-        .collect()
+    let mut blocks = Vec::with_capacity(n.div_ceil(VECTORS_PER_BLOCK));
+    let mut i = 0;
+    while i < n {
+        let end = (i + VECTORS_PER_BLOCK).min(n);
+        let refs: Vec<&[f32]> = (i..end)
+            .map(|j| &emb[j * dims..(j + 1) * dims])
+            .collect();
+        let ts: Vec<u32> = (i..end).map(|j| j as u32).collect();
+        let src = vec![source::DOC; end - i];
+        blocks.push(encode_block(&refs, &ts, &src, dims));
+        i = end;
+    }
+    blocks
 }
 
 fn hit_ids(hits: &[ScoredHit]) -> Vec<usize> {
