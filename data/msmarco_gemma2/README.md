@@ -6,7 +6,7 @@ Proper retrieval benchmark artifacts for `mrl-index` (not SEC self-retrieval).
 |-------|-------------|--------|
 | `smoke` | 8,192 | Pipeline check (128 qrels queries subsampled) |
 | `1m` | 1,000,000 | All MS MARCO dev qrels docs + distractors |
-| `full` | 8,841,823 | Entire BeIR/msmarco passage corpus (no native 10M split) |
+| `full` | 8,841,823 | Entire BeIR/msmarco passage corpus (no native 10M split); Hub: [`astr010/msmarco-gemma2-full`](https://huggingface.co/datasets/astr010/msmarco-gemma2-full) |
 
 ## Contents (per scale directory)
 
