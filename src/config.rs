@@ -36,6 +36,10 @@ pub struct EngineConfig {
     // Axis 2 — Pruning & Recall
     pub shortlist_cand: usize,
     pub cs_tolerance: f32,
+    /// Query-side Stratum-4 MMSE shrinkage weight (`1/√B` default for Gemma@768).
+    /// Encoded `PaxBlock64` bits are invariant to positive fold scaling, so this
+    /// can be swept without re-encoding.
+    pub stratum4_weight: f32,
     pub rabitq_confidence: f32,
 
     // Axis 3 — Latency & Batch
@@ -62,6 +66,7 @@ impl Default for EngineConfig {
             numa_sharding: true,
             shortlist_cand: 64,
             cs_tolerance: 1.0,
+            stratum4_weight: crate::rotate::DEFAULT_STRATUM4_WEIGHT,
             rabitq_confidence: 2.576,
             jit_batch_size: 64,
             io_read_workers: 4,
@@ -85,6 +90,9 @@ impl EngineConfig {
         }
         if !(0.80..=1.20).contains(&self.cs_tolerance) {
             return Err("cs_tolerance must be in [0.80, 1.20]".into());
+        }
+        if !(0.05..=1.50).contains(&self.stratum4_weight) {
+            return Err("stratum4_weight must be in [0.05, 1.50]".into());
         }
         if self.embed_dims < 192 {
             return Err("embed_dims must be >= 192 (prefix 64 + mid 128)".into());

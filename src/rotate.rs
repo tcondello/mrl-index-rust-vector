@@ -66,9 +66,10 @@ pub fn tail_rademacher(block: usize, dim: usize) -> f32 {
     }
 }
 
-/// Fold dims `[TAIL_START..]` into 64 coords: `u_d = n^{-1/2} Σ_b s_{b,d} x_{192+64b+d}`.
+/// Fold dims `[TAIL_START..]` into 64 coords: `u_d = Σ_b s_{b,d} x_{192+64b+d}`.
 ///
-/// For the full 9×64 Gemma@768 tail this is the roadmap `1/3` scale (`1/√9`).
+/// MMSE `1/√B` shrinkage is applied query-side (`EngineConfig::stratum4_weight`),
+/// not here — encode only keeps `sign(FWHT(u))`, which is scale-invariant.
 pub fn fold_tail(vec: &[f32]) -> [f32; TAIL_FOLD_DIMS] {
     let mut u = [0.0f32; TAIL_FOLD_DIMS];
     if vec.len() <= TAIL_START {
@@ -85,10 +86,9 @@ pub fn fold_tail(vec: &[f32]) -> [f32; TAIL_FOLD_DIMS] {
             u[d] += tail_rademacher(b, d) * vec[base + d];
         }
     }
-    let scale = 1.0 / (n_blocks as f32).sqrt();
-    for x in u.iter_mut() {
-        *x *= scale;
-    }
+    // Intentionally unscaled: encode takes `sign(FWHT(u))`, which is invariant to
+    // any positive scale. MMSE / Wiener shrinkage of the Stratum-4 estimator is
+    // applied query-side via `EngineConfig::stratum4_weight` (default `1/√B`).
     u
 }
 
@@ -98,6 +98,23 @@ pub fn rotate_tail_fold(vec: &[f32]) -> [f32; TAIL_FOLD_DIMS] {
     fwht_inplace(&mut buf);
     buf
 }
+
+/// Default MMSE (Wiener) shrinkage for folding `B` Rademacher blocks into 64 signs.
+///
+/// Folding `B` blocks introduces `B(B-1)` cross-block collision terms and raises
+/// estimator noise variance by `B`. Scaling the query-side Stratum-4 contribution
+/// by `1/√B` applies the exact `1/B` MMSE weight (for Gemma@768, `B=9` → `1/3`).
+#[inline]
+pub fn mmse_stratum4_weight(n_blocks: usize) -> f32 {
+    if n_blocks == 0 {
+        1.0
+    } else {
+        1.0 / (n_blocks as f32).sqrt()
+    }
+}
+
+/// Default Stratum-4 weight for EmbeddingGemma-2 @768 (`B = TAIL_FOLD_BLOCKS = 9`).
+pub const DEFAULT_STRATUM4_WEIGHT: f32 = 1.0 / 3.0; // == mmse_stratum4_weight(9)
 
 /// IP scale for 64-d folded-tail 1-bit codes (same derivation as RaBitQ).
 #[inline]

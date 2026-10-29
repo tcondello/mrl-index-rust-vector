@@ -98,6 +98,34 @@ enum Cmd {
         shortlist: usize,
         #[arg(long, default_value = "l1_rabitq")]
         strata: String,
+        /// Query-side Stratum-4 MMSE weight (default 1/√9 ≈ 0.3333).
+        #[arg(long, default_value_t = mrl_index::rotate::DEFAULT_STRATUM4_WEIGHT)]
+        stratum4_weight: f32,
+        /// Cauchy–Schwarz early-reject tolerance.
+        #[arg(long, default_value_t = 1.0)]
+        cs_tolerance: f32,
+    },
+    /// Encode PaxBlocks once; sweep query-side `stratum4_weight` × `cs_tolerance` × shortlist.
+    BenchRetrievalSweep {
+        #[arg(long, default_value = "sweep")]
+        label: String,
+        #[arg(long)]
+        out_dir: PathBuf,
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        queries: Option<usize>,
+        #[arg(long, default_value = "l1_rabitq")]
+        strata: String,
+        /// Comma-separated shortlists, e.g. `256` or `256,512`.
+        #[arg(long, default_value = "256")]
+        shortlists: String,
+        /// Comma-separated Stratum-4 weights.
+        #[arg(long, default_value = "0.20,0.25,0.30,0.3333,0.40")]
+        w_s4: String,
+        /// Comma-separated CS tolerances.
+        #[arg(long, default_value = "1.00,1.05,1.10")]
+        cs: String,
     },
 }
 
@@ -257,14 +285,21 @@ fn main() -> Result<()> {
             queries,
             shortlist,
             strata,
+            stratum4_weight,
+            cs_tolerance,
         } => {
             let strata = parse_strata(&strata)?;
-            let report = mrl_index::retrieval_bench::run_retrieval_bench(
+            let params = mrl_index::retrieval_bench::RetrievalBenchParams {
+                shortlist,
+                strata,
+                stratum4_weight,
+                cs_tolerance,
+            };
+            let report = mrl_index::retrieval_bench::run_retrieval_bench_params(
                 &label,
                 &data,
                 queries,
-                shortlist,
-                strata,
+                params,
             )
             .with_context(|| {
                 format!(
@@ -280,6 +315,64 @@ fn main() -> Result<()> {
                 std::fs::write(&path, report.to_json_pretty())?;
                 println!("wrote {}", path.display());
             }
+        }
+        Cmd::BenchRetrievalSweep {
+            label,
+            out_dir,
+            data,
+            queries,
+            strata,
+            shortlists,
+            w_s4,
+            cs,
+        } => {
+            let strata = parse_strata(&strata)?;
+            let parse_f32s = |s: &str| -> Result<Vec<f32>> {
+                s.split(',')
+                    .map(|p| p.trim().parse::<f32>().map_err(|e| anyhow::anyhow!("{e}")))
+                    .collect()
+            };
+            let parse_usizes = |s: &str| -> Result<Vec<usize>> {
+                s.split(',')
+                    .map(|p| p.trim().parse::<usize>().map_err(|e| anyhow::anyhow!("{e}")))
+                    .collect()
+            };
+            let shortlists = parse_usizes(&shortlists)?;
+            let w_s4 = parse_f32s(&w_s4)?;
+            let cs = parse_f32s(&cs)?;
+            std::fs::create_dir_all(&out_dir)?;
+            let reports = mrl_index::retrieval_bench::run_retrieval_sweep(
+                &data,
+                queries,
+                strata,
+                &shortlists,
+                &w_s4,
+                &cs,
+                &label,
+            )
+            .with_context(|| format!("sweep from {}", data.display()))?;
+            let mut summary = Vec::new();
+            for (i, report) in reports.iter().enumerate() {
+                let path = out_dir.join(format!("cell_{i:03}_{}.json", report.label));
+                std::fs::write(&path, report.to_json_pretty())?;
+                summary.push(serde_json::json!({
+                    "file": path.file_name().and_then(|s| s.to_str()),
+                    "label": report.label,
+                    "shortlist": report.shortlist,
+                    "stratum4_weight": report.stratum4_weight,
+                    "cs_tolerance": report.cs_tolerance,
+                    "reranked_R@10": report.reranked_recall_at_10,
+                    "qrels_R@10": report.qrels_recall_at_10,
+                    "qrels_nDCG@10": report.qrels_ndcg_at_10,
+                    "mean_scan_ms": report.mean_scan_ms,
+                }));
+            }
+            let summary_path = out_dir.join("sweep_summary.json");
+            std::fs::write(
+                &summary_path,
+                serde_json::to_string_pretty(&summary)?,
+            )?;
+            println!("wrote {} cells + {}", reports.len(), summary_path.display());
         }
     }
     Ok(())

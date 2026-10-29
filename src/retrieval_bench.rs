@@ -327,6 +327,10 @@ pub struct RetrievalBenchReport {
     pub shortlist: usize,
     pub strata: String,
     pub corpus_mmap: bool,
+    #[serde(default)]
+    pub stratum4_weight: f32,
+    #[serde(default)]
+    pub cs_tolerance: f32,
     pub shortlist_coverage_at_10: f64,
     pub reranked_recall_at_10: f64,
     pub reranked_recall_at_100: f64,
@@ -335,6 +339,25 @@ pub struct RetrievalBenchReport {
     pub mean_scan_ms: f64,
     pub mvecs_per_sec: f64,
     pub encode_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RetrievalBenchParams {
+    pub shortlist: usize,
+    pub strata: StrataDepth,
+    pub stratum4_weight: f32,
+    pub cs_tolerance: f32,
+}
+
+impl Default for RetrievalBenchParams {
+    fn default() -> Self {
+        Self {
+            shortlist: 256,
+            strata: StrataDepth::L1Rabitq,
+            stratum4_weight: crate::rotate::DEFAULT_STRATUM4_WEIGHT,
+            cs_tolerance: 1.0,
+        }
+    }
 }
 
 fn strata_name(s: StrataDepth) -> String {
@@ -352,13 +375,30 @@ pub fn run_retrieval_bench(
     shortlist: usize,
     strata: StrataDepth,
 ) -> Result<RetrievalBenchReport, CorpusError> {
+    run_retrieval_bench_params(
+        label,
+        data_dir,
+        n_queries,
+        RetrievalBenchParams {
+            shortlist,
+            strata,
+            ..RetrievalBenchParams::default()
+        },
+    )
+}
+
+pub fn run_retrieval_bench_params(
+    label: &str,
+    data_dir: &Path,
+    n_queries: Option<usize>,
+    params: RetrievalBenchParams,
+) -> Result<RetrievalBenchReport, CorpusError> {
     let data = RetrievalBenchData::load(data_dir)?;
     let dims = data.dims();
     let n = data.n_corpus();
     let q_total = data.n_queries();
     let n_queries = n_queries.unwrap_or(q_total).min(q_total);
 
-    // Sequential pass to build PaxBlocks from mmap, then random for rerank.
     data.corpus_embeddings.advise_sequential();
     let t_enc = Instant::now();
     eprintln!("encode PaxBlocks n={n} dims={dims} …");
@@ -371,10 +411,81 @@ pub fn run_retrieval_bench(
     );
     data.corpus_embeddings.advise_random();
 
+    Ok(eval_retrieval_on_blocks(
+        label, &data, &blocks, n_queries, params, encode_ms,
+    ))
+}
+
+/// Encode PaxBlocks once, then evaluate many `(w_s4, cs_tolerance, shortlist)` cells.
+/// Encoded bits are invariant to positive fold scaling, so this is a pure query-side sweep.
+pub fn run_retrieval_sweep(
+    data_dir: &Path,
+    n_queries: Option<usize>,
+    strata: StrataDepth,
+    shortlists: &[usize],
+    w_s4_values: &[f32],
+    cs_values: &[f32],
+    label_prefix: &str,
+) -> Result<Vec<RetrievalBenchReport>, CorpusError> {
+    let data = RetrievalBenchData::load(data_dir)?;
+    let dims = data.dims();
+    let n = data.n_corpus();
+    let q_total = data.n_queries();
+    let n_queries = n_queries.unwrap_or(q_total).min(q_total);
+
+    data.corpus_embeddings.advise_sequential();
+    let t_enc = Instant::now();
+    eprintln!("encode PaxBlocks once n={n} dims={dims} (sweep reuses blocks) …");
+    let blocks = encode_corpus_mmap(&data.corpus_embeddings);
+    let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "encode done: {} blocks in {:.1} s — {} cells",
+        blocks.len(),
+        encode_ms / 1000.0,
+        shortlists.len() * w_s4_values.len() * cs_values.len()
+    );
+    data.corpus_embeddings.advise_random();
+
+    let mut reports = Vec::new();
+    for &sl in shortlists {
+        for &w in w_s4_values {
+            for &cs in cs_values {
+                let label = format!("{label_prefix}-sl{sl}-w{w:.4}-cs{cs:.2}");
+                eprintln!("=== sweep cell {label} ===");
+                let params = RetrievalBenchParams {
+                    shortlist: sl,
+                    strata,
+                    stratum4_weight: w,
+                    cs_tolerance: cs,
+                };
+                let report = eval_retrieval_on_blocks(
+                    &label, &data, &blocks, n_queries, params, encode_ms,
+                );
+                report.print_summary();
+                reports.push(report);
+            }
+        }
+    }
+    Ok(reports)
+}
+
+fn eval_retrieval_on_blocks(
+    label: &str,
+    data: &RetrievalBenchData,
+    blocks: &[PaxBlock64],
+    n_queries: usize,
+    params: RetrievalBenchParams,
+    encode_ms: f64,
+) -> RetrievalBenchReport {
+    let dims = data.dims();
+    let n = data.n_corpus();
+
     let mut cfg = EngineConfig::default();
     cfg.embed_dims = dims;
-    cfg.shortlist_cand = shortlist;
-    cfg.strata_depth = strata;
+    cfg.shortlist_cand = params.shortlist;
+    cfg.strata_depth = params.strata;
+    cfg.stratum4_weight = params.stratum4_weight;
+    cfg.cs_tolerance = params.cs_tolerance;
     cfg.temporal_filter_enable = false;
 
     let mut coverage10 = 0.0;
@@ -393,7 +504,7 @@ pub fn run_retrieval_bench(
         let plan = QueryPlan::from_query(q, dims);
 
         let t = Instant::now();
-        let hits = scan_blocks(&blocks, &plan, &cfg, None, None);
+        let hits = scan_blocks(blocks, &plan, &cfg, None, None);
         scan_ms_sum += t.elapsed().as_secs_f64() * 1000.0;
         let ids = hit_ids(&hits);
 
@@ -431,18 +542,20 @@ pub fn run_retrieval_bench(
     let mvecs = (n as f64 / (mean_scan_ms / 1000.0)) / 1e6;
     let qrels_denom = qrels_n.max(1) as f64;
 
-    Ok(RetrievalBenchReport {
+    RetrievalBenchReport {
         label: label.into(),
-        corpus: format!("{} / {}", data.manifest.dataset, data_dir.display()),
+        corpus: format!("{} / {}", data.manifest.dataset, data.dir.display()),
         model: data.manifest.model.clone(),
         scale: data.manifest.scale.clone(),
         mrl: true,
         n_vectors: n,
         n_queries,
         dims,
-        shortlist,
-        strata: strata_name(strata),
+        shortlist: params.shortlist,
+        strata: strata_name(params.strata),
         corpus_mmap: true,
+        stratum4_weight: params.stratum4_weight,
+        cs_tolerance: params.cs_tolerance,
         shortlist_coverage_at_10: coverage10 / n_queries as f64,
         reranked_recall_at_10: rerank10 / n_queries as f64,
         reranked_recall_at_100: rerank100 / n_queries as f64,
@@ -451,7 +564,7 @@ pub fn run_retrieval_bench(
         mean_scan_ms,
         mvecs_per_sec: mvecs,
         encode_ms,
-    })
+    }
 }
 
 impl RetrievalBenchReport {

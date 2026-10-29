@@ -437,10 +437,11 @@ pub fn scan_block(
                 bits &= bits - 1;
             }
         }
+        let w_s4 = cfg.stratum4_weight;
         let mut s_bits = survivors;
         while s_bits != 0 {
             let v = s_bits.trailing_zeros() as usize;
-            scores[v] += s4_dot[v] * high_n[v].max(1e-6);
+            scores[v] += s4_dot[v] * high_n[v].max(1e-6) * w_s4;
             s_bits &= s_bits - 1;
         }
     }
