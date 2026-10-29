@@ -149,21 +149,21 @@ pub struct Gemma2Config {
 }
 
 impl Gemma2Config {
-    /// Production `google/embeddinggemma-2` (270M @ 768-d MRL) configuration.
+    /// Production `google/embeddinggemma-2` (`EmbeddingGemma2TextModel` @ 768-d MRL) configuration.
     pub fn gemma2_768() -> Self {
         Self {
             vocab_size: 262_144,
-            hidden_size: 1024,
-            intermediate_size: 4096,
+            hidden_size: 512,
+            intermediate_size: 2048,
             num_hidden_layers: 24,
             early_exit_layer: 8,
-            num_attention_heads: 8,
+            num_attention_heads: 4,
             num_key_value_heads: 2,
             head_dim: 256,
             embed_dims: EMBED_DIMS_768,
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
-            attn_logit_softcapping: Some(50.0),
+            attn_logit_softcapping: None,
             stage1_max_tokens: 64,
             stage1_keep_ratio: 0.25,
         }
@@ -191,18 +191,30 @@ impl Gemma2Config {
     }
 }
 
-/// Weights for a single Gemma-2 Transformer layer.
+/// Weights for a single Gemma-2 / `EmbeddingGemma2EncoderLayer` Transformer layer.
 #[derive(Debug, Clone)]
 pub struct Gemma2LayerWeights {
+    pub head_dim: usize,
+    pub num_kv_heads: usize,
+    pub rope_theta: f32,
+    pub sliding_window: Option<usize>,
     pub input_layernorm: Vec<f32>,          // [hidden_size]
     pub q_proj: Vec<f32>,                   // [num_heads * head_dim, hidden_size]
     pub k_proj: Vec<f32>,                   // [num_kv_heads * head_dim, hidden_size]
     pub v_proj: Vec<f32>,                   // [num_kv_heads * head_dim, hidden_size]
     pub o_proj: Vec<f32>,                   // [hidden_size, num_heads * head_dim]
+    pub q_norm: Option<Vec<f32>>,           // [head_dim] (EmbeddingGemma2Attention)
+    pub k_norm: Option<Vec<f32>>,           // [head_dim] (EmbeddingGemma2Attention)
     pub post_attention_layernorm: Vec<f32>, // [hidden_size]
+    pub pre_feedforward_layernorm: Option<Vec<f32>>,  // [hidden_size]
     pub gate_proj: Vec<f32>,                // [intermediate_size, hidden_size]
     pub up_proj: Vec<f32>,                  // [intermediate_size, hidden_size]
     pub down_proj: Vec<f32>,                // [hidden_size, intermediate_size]
+    pub post_feedforward_layernorm: Option<Vec<f32>>, // [hidden_size]
+    pub ple_input_gate: Option<Vec<f32>>,   // [hidden_size, hidden_size]
+    pub ple_projection: Option<Vec<f32>>,   // [hidden_size, hidden_size]
+    pub ple_post_norm: Option<Vec<f32>>,    // [hidden_size]
+    pub layer_scalar: f32,
 }
 
 /// Precomputed and pinned K/V cache for a static task instruction prefix across all layers.
@@ -390,6 +402,13 @@ pub struct Gemma2Embedder {
     /// when `token_emb_table` has fewer rows than `vocab_size`.
     token_emb_table: Vec<f32>,
     token_emb_rows: usize,
+    /// Whether `apply_rms_norm` multiplies by `w[i]` directly (`true` for `EmbeddingGemma2TextModel`)
+    /// or `(1.0 + w[i])` (`false` for legacy Gemma-2).
+    direct_rms_norm: bool,
+    /// Optional Per-Layer Embeddings (`EmbeddingGemma2TextPLE`) projection `[num_layers * hidden_size, hidden_size]`.
+    ple_model_proj: Option<Vec<f32>>,
+    /// Optional Per-Layer Embeddings RMSNorm weight `[hidden_size]`.
+    ple_proj_norm: Option<Vec<f32>>,
     layers: Vec<Gemma2LayerWeights>,
     final_norm: Vec<f32>, // [hidden_size]
     /// Original 768-d projection matrix `[768, hidden_size]`.
@@ -403,6 +422,8 @@ pub struct Gemma2Embedder {
     query_prefix_cache: Option<PrefixKVCache>,
     /// Optional vocabulary string-to-id map (from `tokenizer.json`).
     vocab_map: HashMap<String, u32>,
+    /// Optional BPE merge table `(id_a, id_b) -> (rank, merged_id)` (from `tokenizer.json`).
+    bpe_merges: HashMap<(u32, u32), (u32, u32)>,
 }
 
 impl Gemma2Embedder {
@@ -437,15 +458,27 @@ impl Gemma2Embedder {
             let attn_scale = 0.25 / (d as f32).sqrt();
             let mlp_scale = 0.25 / (inter as f32).sqrt();
             layers.push(Gemma2LayerWeights {
+                head_dim: cfg.head_dim,
+                num_kv_heads: cfg.num_key_value_heads,
+                rope_theta: cfg.rope_theta,
+                sliding_window: None,
                 input_layernorm: vec![0.0f32; d], // Gemma-2 RMSNorm adds (1.0 + w)
                 q_proj: (0..q_dim * d).map(|_| next_f32(attn_scale)).collect(),
                 k_proj: (0..kv_dim * d).map(|_| next_f32(attn_scale)).collect(),
                 v_proj: (0..kv_dim * d).map(|_| next_f32(attn_scale)).collect(),
                 o_proj: (0..d * q_dim).map(|_| next_f32(attn_scale)).collect(),
+                q_norm: None,
+                k_norm: None,
                 post_attention_layernorm: vec![0.0f32; d],
+                pre_feedforward_layernorm: None,
                 gate_proj: (0..inter * d).map(|_| next_f32(attn_scale)).collect(),
                 up_proj: (0..inter * d).map(|_| next_f32(attn_scale)).collect(),
                 down_proj: (0..d * inter).map(|_| next_f32(mlp_scale)).collect(),
+                post_feedforward_layernorm: None,
+                ple_input_gate: None,
+                ple_projection: None,
+                ple_post_norm: None,
+                layer_scalar: 1.0,
             });
         }
 
@@ -466,6 +499,9 @@ impl Gemma2Embedder {
             cfg,
             token_emb_table,
             token_emb_rows,
+            direct_rms_norm: false,
+            ple_model_proj: None,
+            ple_proj_norm: None,
             layers,
             final_norm,
             w_proj,
@@ -473,6 +509,7 @@ impl Gemma2Embedder {
             w_early_64,
             query_prefix_cache: None,
             vocab_map: HashMap::new(),
+            bpe_merges: HashMap::new(),
         };
         embedder.pin_query_prefix(DEFAULT_QUERY_TASK_PREFIX);
         embedder
@@ -487,31 +524,95 @@ impl Gemma2Embedder {
         let st = SafeTensorsView::parse(safetensors_bytes)?;
         let d = cfg.hidden_size;
 
-        let token_emb_table = st.load_f32("model.embed_tokens.weight")?;
+        // Support both official HF `language_model.*` (`EmbeddingGemma2Model`) and generic `model.*`
+        let is_official_hf = st.tensor_shape("language_model.embed_tokens.weight").is_some();
+        let pfx_root = if is_official_hf {
+            "language_model"
+        } else {
+            "model"
+        };
+
+        let token_emb_table = st.load_f32(&format!("{pfx_root}.embed_tokens.weight"))?;
         if token_emb_table.len() % d != 0 {
-            return Err("model.embed_tokens.weight length not divisible by hidden_size".into());
+            return Err("embed_tokens.weight length not divisible by hidden_size".into());
         }
         let token_emb_rows = token_emb_table.len() / d;
 
+        let ple_model_proj = st
+            .load_f32(&format!("{pfx_root}.ple.per_layer_model_projection.weight"))
+            .ok();
+        let ple_proj_norm = st
+            .load_f32(&format!("{pfx_root}.ple.per_layer_projection_norm.weight"))
+            .ok();
+
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
-            let pfx = format!("model.layers.{l}");
+            let pfx = format!("{pfx_root}.layers.{l}");
+            let is_full_attn = is_official_hf && ((l + 1) % 6 == 0);
+            let head_dim = if is_full_attn { 512 } else { cfg.head_dim };
+            let num_kv_heads = if is_full_attn {
+                1
+            } else {
+                cfg.num_key_value_heads
+            };
+            let rope_theta = if is_full_attn {
+                1_000_000.0
+            } else {
+                cfg.rope_theta
+            };
+            let sliding_window = if is_official_hf && !is_full_attn {
+                Some(512)
+            } else {
+                None
+            };
+            let layer_scalar = st
+                .load_f32(&format!("{pfx}.layer_scalar"))
+                .ok()
+                .and_then(|v| v.first().copied())
+                .unwrap_or(1.0);
+
             layers.push(Gemma2LayerWeights {
+                head_dim,
+                num_kv_heads,
+                rope_theta,
+                sliding_window,
                 input_layernorm: st.load_f32(&format!("{pfx}.input_layernorm.weight"))?,
                 q_proj: st.load_f32(&format!("{pfx}.self_attn.q_proj.weight"))?,
                 k_proj: st.load_f32(&format!("{pfx}.self_attn.k_proj.weight"))?,
                 v_proj: st.load_f32(&format!("{pfx}.self_attn.v_proj.weight"))?,
                 o_proj: st.load_f32(&format!("{pfx}.self_attn.o_proj.weight"))?,
+                q_norm: st.load_f32(&format!("{pfx}.self_attn.q_norm.weight")).ok(),
+                k_norm: st.load_f32(&format!("{pfx}.self_attn.k_norm.weight")).ok(),
                 post_attention_layernorm: st
                     .load_f32(&format!("{pfx}.post_attention_layernorm.weight"))?,
+                pre_feedforward_layernorm: st
+                    .load_f32(&format!("{pfx}.pre_feedforward_layernorm.weight"))
+                    .ok(),
                 gate_proj: st.load_f32(&format!("{pfx}.mlp.gate_proj.weight"))?,
                 up_proj: st.load_f32(&format!("{pfx}.mlp.up_proj.weight"))?,
                 down_proj: st.load_f32(&format!("{pfx}.mlp.down_proj.weight"))?,
+                post_feedforward_layernorm: st
+                    .load_f32(&format!("{pfx}.post_feedforward_layernorm.weight"))
+                    .ok(),
+                ple_input_gate: st
+                    .load_f32(&format!("{pfx}.ple_block.per_layer_input_gate.weight"))
+                    .ok(),
+                ple_projection: st
+                    .load_f32(&format!("{pfx}.ple_block.per_layer_projection.weight"))
+                    .ok(),
+                ple_post_norm: st
+                    .load_f32(&format!("{pfx}.ple_block.post_per_layer_input_norm.weight"))
+                    .ok(),
+                layer_scalar,
             });
         }
 
-        let final_norm = st.load_f32("model.norm.weight")?;
-        let w_proj = st.load_f32("projection.weight")?;
+        let final_norm = st.load_f32(&format!("{pfx_root}.norm.weight"))?;
+        let w_proj = if is_official_hf {
+            st.load_f32("language_model.embedding_projection.weight")?
+        } else {
+            st.load_f32("projection.weight")?
+        };
         if w_proj.len() != EMBED_DIMS_768 * d {
             return Err(format!(
                 "projection.weight expected {} elements, got {}",
@@ -529,6 +630,9 @@ impl Gemma2Embedder {
             cfg,
             token_emb_table,
             token_emb_rows,
+            direct_rms_norm: is_official_hf,
+            ple_model_proj,
+            ple_proj_norm,
             layers,
             final_norm,
             w_proj,
@@ -536,6 +640,7 @@ impl Gemma2Embedder {
             w_early_64,
             query_prefix_cache: None,
             vocab_map: HashMap::new(),
+            bpe_merges: HashMap::new(),
         };
         embedder.pin_query_prefix(DEFAULT_QUERY_TASK_PREFIX);
         Ok(embedder)
@@ -549,6 +654,73 @@ impl Gemma2Embedder {
         let file = std::fs::File::open(path.as_ref()).map_err(|e| format!("open: {e}"))?;
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| format!("mmap: {e}"))? };
         Self::from_safetensors_bytes(cfg, &mmap)
+    }
+
+    /// Load the real `google/embeddinggemma-2` checkpoint directory (`model.safetensors` + `tokenizer.json`),
+    /// folding the 768-d projection + FWHT matrices offline into `w_proj_augmented` (`[960, 512]`).
+    pub fn from_hf_snapshot_dir(dir: impl AsRef<Path>) -> Result<Self, String> {
+        let dir = dir.as_ref();
+        let st_path = dir.join("model.safetensors");
+        let mut embedder = Self::from_safetensors_file(Gemma2Config::gemma2_768(), &st_path)?;
+        let tok_path = dir.join("tokenizer.json");
+        if tok_path.exists() {
+            embedder.load_tokenizer_json(&tok_path)?;
+            embedder.pin_query_prefix(DEFAULT_QUERY_TASK_PREFIX);
+        }
+        Ok(embedder)
+    }
+
+    /// Parse `tokenizer.json` (`model.vocab` + `model.merges`) for exact SentencePiece BPE tokenization.
+    pub fn load_tokenizer_json(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
+        let bytes = std::fs::read(path.as_ref()).map_err(|e| format!("read tokenizer.json: {e}"))?;
+        let root: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| format!("parse tokenizer.json: {e}"))?;
+        let model = root
+            .get("model")
+            .ok_or_else(|| "missing `model` in tokenizer.json".to_string())?;
+        let vocab_obj = model
+            .get("vocab")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| "missing `model.vocab` in tokenizer.json".to_string())?;
+
+        let mut vocab_map = HashMap::with_capacity(vocab_obj.len());
+        for (tok_str, id_val) in vocab_obj {
+            if let Some(id) = id_val.as_u64() {
+                vocab_map.insert(tok_str.clone(), id as u32);
+            }
+        }
+
+        let mut bpe_merges = HashMap::new();
+        if let Some(merges_arr) = model.get("merges").and_then(|v| v.as_array()) {
+            bpe_merges.reserve(merges_arr.len());
+            for (rank, entry) in merges_arr.iter().enumerate() {
+                let pair_opt: Option<(&str, &str)> = if let Some(arr) = entry.as_array() {
+                    if arr.len() == 2 {
+                        Some((arr[0].as_str().unwrap_or(""), arr[1].as_str().unwrap_or("")))
+                    } else {
+                        None
+                    }
+                } else if let Some(s) = entry.as_str() {
+                    s.split_once(' ')
+                } else {
+                    None
+                };
+                if let Some((a, b)) = pair_opt {
+                    if let (Some(&id_a), Some(&id_b)) = (vocab_map.get(a), vocab_map.get(b)) {
+                        let mut merged_str = String::with_capacity(a.len() + b.len());
+                        merged_str.push_str(a);
+                        merged_str.push_str(b);
+                        if let Some(&id_ab) = vocab_map.get(&merged_str) {
+                            bpe_merges.insert((id_a, id_b), (rank as u32, id_ab));
+                        }
+                    }
+                }
+            }
+        }
+
+        self.vocab_map = vocab_map;
+        self.bpe_merges = bpe_merges;
+        Ok(())
     }
 
     /// Export this model's weights into a `BF16` SafeTensors byte buffer.
@@ -664,7 +836,13 @@ impl Gemma2Embedder {
     /// Look up token embeddings `[N, hidden_size]` and scale by `√hidden_size` (Gemma convention).
     fn lookup_tokens(&self, tokens: &[u32]) -> Vec<f32> {
         let d = self.cfg.hidden_size;
-        let scale = (d as f32).sqrt();
+        // In EmbeddingGemma2TextScaledWordEmbedding, embed_scale is cast to BF16:
+        // bf16(sqrt(512.0)) = 22.625f32.
+        let scale = if self.direct_rms_norm {
+            bf16::from_f32((d as f32).sqrt()).to_f32()
+        } else {
+            (d as f32).sqrt()
+        };
         let mut out = vec![0.0f32; tokens.len() * d];
         for (i, &tok) in tokens.iter().enumerate() {
             let row = (tok as usize) % self.token_emb_rows;
@@ -692,37 +870,57 @@ impl Gemma2Embedder {
         out
     }
 
-    /// Gemma-2 RMSNorm in `f32` accumulation: `y_i = (x_i / rms(x)) * (1.0 + w_i)`.
-    fn apply_rms_norm(&self, x: &[f32], weight: &[f32]) -> Vec<f32> {
-        let d = self.cfg.hidden_size;
-        let n_tokens = x.len() / d;
+    /// RMSNorm in `f32` accumulation across rows of width `dim`.
+    fn apply_rms_norm_dim(&self, x: &[f32], weight: Option<&[f32]>, dim: usize) -> Vec<f32> {
+        let n_rows = x.len() / dim;
         let mut out = vec![0.0f32; x.len()];
-        for t in 0..n_tokens {
-            let row = &x[t * d..(t + 1) * d];
-            let out_row = &mut out[t * d..(t + 1) * d];
+        for t in 0..n_rows {
+            let row = &x[t * dim..(t + 1) * dim];
+            let out_row = &mut out[t * dim..(t + 1) * dim];
             let mut sq_sum = 0.0f32;
             for &v in row {
                 sq_sum += v * v;
             }
-            let inv_rms = 1.0 / ((sq_sum / d as f32) + self.cfg.rms_norm_eps).sqrt();
-            for c in 0..d {
-                out_row[c] = row[c] * inv_rms * (1.0 + weight[c]);
+            let inv_rms = 1.0 / ((sq_sum / dim as f32) + self.cfg.rms_norm_eps).sqrt();
+            if let Some(w) = weight {
+                if self.direct_rms_norm {
+                    for c in 0..dim {
+                        out_row[c] = row[c] * inv_rms * w[c];
+                    }
+                } else {
+                    for c in 0..dim {
+                        out_row[c] = row[c] * inv_rms * (1.0 + w[c]);
+                    }
+                }
+            } else {
+                for c in 0..dim {
+                    out_row[c] = row[c] * inv_rms;
+                }
             }
         }
         out
     }
 
+    /// Gemma-2 RMSNorm over `self.cfg.hidden_size`.
+    fn apply_rms_norm(&self, x: &[f32], weight: &[f32]) -> Vec<f32> {
+        self.apply_rms_norm_dim(x, Some(weight), self.cfg.hidden_size)
+    }
+
     /// Apply Rotary Position Embeddings (RoPE) in-place to `[n_heads, head_dim]` at position `pos`.
     #[inline]
-    fn apply_rope_token(&self, heads_vec: &mut [f32], n_heads: usize, pos: usize) {
-        let hd = self.cfg.head_dim;
+    fn apply_rope_token_with(
+        heads_vec: &mut [f32],
+        n_heads: usize,
+        hd: usize,
+        rope_theta: f32,
+        pos: usize,
+    ) {
         let half = hd / 2;
         let pos_f = pos as f32;
         for h in 0..n_heads {
             let base = h * hd;
             for i in 0..half {
-                let freq =
-                    1.0 / self.cfg.rope_theta.powf((2 * i) as f32 / (hd as f32));
+                let freq = 1.0 / rope_theta.powf((2 * i) as f32 / (hd as f32));
                 let angle = pos_f * freq;
                 let (sin_a, cos_a) = angle.sin_cos();
                 let x0 = heads_vec[base + i];
@@ -743,8 +941,8 @@ impl Gemma2Embedder {
     ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let d = self.cfg.hidden_size;
         let n_heads = self.cfg.num_attention_heads;
-        let n_kv = self.cfg.num_key_value_heads;
-        let hd = self.cfg.head_dim;
+        let n_kv = layer.num_kv_heads;
+        let hd = layer.head_dim;
         let q_dim = n_heads * hd;
         let kv_dim = n_kv * hd;
         let gqa_group = n_heads / n_kv;
@@ -759,14 +957,38 @@ impl Gemma2Embedder {
         gemm_nt_f32(&normed, &layer.k_proj, &mut k, seq_len, kv_dim, d);
         gemm_nt_f32(&normed, &layer.v_proj, &mut v, seq_len, kv_dim, d);
 
+        if let Some(ref qn) = layer.q_norm {
+            q = self.apply_rms_norm_dim(&q, Some(qn), hd);
+        }
+        if let Some(ref kn) = layer.k_norm {
+            k = self.apply_rms_norm_dim(&k, Some(kn), hd);
+            v = self.apply_rms_norm_dim(&v, None, hd);
+        }
+
         for t in 0..seq_len {
             let pos = pos_offset + t;
-            self.apply_rope_token(&mut q[t * q_dim..(t + 1) * q_dim], n_heads, pos);
-            self.apply_rope_token(&mut k[t * kv_dim..(t + 1) * kv_dim], n_kv, pos);
+            Self::apply_rope_token_with(
+                &mut q[t * q_dim..(t + 1) * q_dim],
+                n_heads,
+                hd,
+                layer.rope_theta,
+                pos,
+            );
+            Self::apply_rope_token_with(
+                &mut k[t * kv_dim..(t + 1) * kv_dim],
+                n_kv,
+                hd,
+                layer.rope_theta,
+                pos,
+            );
         }
 
         let total_kv_len = pos_offset + seq_len;
-        let attn_scale = 1.0 / (hd as f32).sqrt();
+        let attn_scale = if layer.q_norm.is_some() {
+            1.0
+        } else {
+            1.0 / (hd as f32).sqrt()
+        };
         let mut attn_out = vec![0.0f32; seq_len * q_dim];
         let mut scores = vec![0.0f32; total_kv_len];
 
@@ -827,17 +1049,28 @@ impl Gemma2Embedder {
         gemm_nt_f32(&attn_out, &layer.o_proj, &mut proj_attn, seq_len, d, q_dim);
 
         let mut res1 = vec![0.0f32; seq_len * d];
-        for i in 0..res1.len() {
-            res1[i] = hidden[i] + proj_attn[i];
+        if layer.pre_feedforward_layernorm.is_some() {
+            let post_attn = self.apply_rms_norm(&proj_attn, &layer.post_attention_layernorm);
+            for i in 0..res1.len() {
+                res1[i] = hidden[i] + post_attn[i];
+            }
+        } else {
+            for i in 0..res1.len() {
+                res1[i] = hidden[i] + proj_attn[i];
+            }
         }
 
         // GeGLU MLP
-        let post_norm = self.apply_rms_norm(&res1, &layer.post_attention_layernorm);
+        let ffn_in = if let Some(ref pre_ffn) = layer.pre_feedforward_layernorm {
+            self.apply_rms_norm(&res1, pre_ffn)
+        } else {
+            self.apply_rms_norm(&res1, &layer.post_attention_layernorm)
+        };
         let inter = self.cfg.intermediate_size;
         let mut gate = vec![0.0f32; seq_len * inter];
         let mut up = vec![0.0f32; seq_len * inter];
-        gemm_nt_f32(&post_norm, &layer.gate_proj, &mut gate, seq_len, inter, d);
-        gemm_nt_f32(&post_norm, &layer.up_proj, &mut up, seq_len, inter, d);
+        gemm_nt_f32(&ffn_in, &layer.gate_proj, &mut gate, seq_len, inter, d);
+        gemm_nt_f32(&ffn_in, &layer.up_proj, &mut up, seq_len, inter, d);
 
         for i in 0..gate.len() {
             gate[i] = gelu_tanh(gate[i]) * up[i];
@@ -846,8 +1079,15 @@ impl Gemma2Embedder {
         let mut mlp_out = vec![0.0f32; seq_len * d];
         gemm_nt_f32(&gate, &layer.down_proj, &mut mlp_out, seq_len, d, inter);
 
-        for i in 0..res1.len() {
-            res1[i] += mlp_out[i];
+        if let Some(ref post_ffn) = layer.post_feedforward_layernorm {
+            let mlp_normed = self.apply_rms_norm(&mlp_out, post_ffn);
+            for i in 0..res1.len() {
+                res1[i] += mlp_normed[i];
+            }
+        } else {
+            for i in 0..res1.len() {
+                res1[i] += mlp_out[i];
+            }
         }
 
         (res1, k, v)
@@ -868,36 +1108,112 @@ impl Gemma2Embedder {
         }
 
         let n_heads = self.cfg.num_attention_heads;
-        let n_kv = self.cfg.num_key_value_heads;
-        let hd = self.cfg.head_dim;
-        let q_dim = n_heads * hd;
-        let kv_dim = n_kv * hd;
-        let gqa_group = n_heads / n_kv;
         let inter = self.cfg.intermediate_size;
-        let attn_scale = 1.0 / (hd as f32).sqrt();
+        let num_layers = self.cfg.num_hidden_layers;
 
         let mut hidden = self.lookup_tokens(batch.tokens);
-        let mut q = vec![0.0f32; total_tokens * q_dim];
-        let mut k = vec![0.0f32; total_tokens * kv_dim];
-        let mut v = vec![0.0f32; total_tokens * kv_dim];
-        let mut attn_out = vec![0.0f32; total_tokens * q_dim];
+
+        // Precompute Per-Layer Embeddings (`EmbeddingGemma2TextPLE`) if present
+        let ple_normed: Option<Vec<f32>> = if let (Some(ref ple_w), Some(ref ple_n)) =
+            (&self.ple_model_proj, &self.ple_proj_norm)
+        {
+            let mut ple_raw = vec![0.0f32; total_tokens * num_layers * d];
+            gemm_nt_f32(
+                &hidden,
+                ple_w,
+                &mut ple_raw,
+                total_tokens,
+                num_layers * d,
+                d,
+            );
+            let ple_scale = 1.0 / (d as f32).sqrt();
+            for v in &mut ple_raw {
+                *v *= ple_scale;
+            }
+            Some(self.apply_rms_norm_dim(&ple_raw, Some(ple_n), d))
+        } else {
+            None
+        };
+
         let mut proj_attn = vec![0.0f32; total_tokens * d];
         let mut gate = vec![0.0f32; total_tokens * inter];
         let mut up = vec![0.0f32; total_tokens * inter];
         let mut mlp_out = vec![0.0f32; total_tokens * d];
+        let mut ple_gate = vec![0.0f32; total_tokens * d];
+        let mut ple_proj = vec![0.0f32; total_tokens * d];
 
         let max_layer = up_to_layer.min(self.layers.len());
-        for layer in &self.layers[..max_layer] {
+        for (l_idx, layer) in self.layers[..max_layer].iter().enumerate() {
+            let hd = layer.head_dim;
+            let n_kv = layer.num_kv_heads;
+            let q_dim = n_heads * hd;
+            let kv_dim = n_kv * hd;
+            let gqa_group = n_heads / n_kv;
+            let attn_scale = if layer.q_norm.is_some() {
+                1.0
+            } else {
+                1.0 / (hd as f32).sqrt()
+            };
+
             let normed = self.apply_rms_norm(&hidden, &layer.input_layernorm);
+
+            let mut q = vec![0.0f32; total_tokens * q_dim];
+            let mut k = vec![0.0f32; total_tokens * kv_dim];
+            let mut v = vec![0.0f32; total_tokens * kv_dim];
+            let mut attn_out = vec![0.0f32; total_tokens * q_dim];
 
             // Dense ragged GEMMs across all sequences at once (zero padding tokens!)
             gemm_nt_f32(&normed, &layer.q_proj, &mut q, total_tokens, q_dim, d);
             gemm_nt_f32(&normed, &layer.k_proj, &mut k, total_tokens, kv_dim, d);
             gemm_nt_f32(&normed, &layer.v_proj, &mut v, total_tokens, kv_dim, d);
 
-            attn_out.fill(0.0);
+            if let Some(ref qn) = layer.q_norm {
+                q = self.apply_rms_norm_dim(&q, Some(qn), hd);
+            }
+            if let Some(ref kn) = layer.k_norm {
+                k = self.apply_rms_norm_dim(&k, Some(kn), hd);
+                v = self.apply_rms_norm_dim(&v, None, hd);
+            }
 
-            // Block-diagonal FlashAttention per sequence span [start..end) with RoPE position reset
+            // Precompute inverse frequencies once per layer
+            let half = hd / 2;
+            let inv_freq: Vec<f32> = (0..half)
+                .map(|i| 1.0 / layer.rope_theta.powf((2 * i) as f32 / (hd as f32)))
+                .collect();
+
+            // Apply RoPE per sequence (sharing sin/cos across all Q and K heads at each position)
+            for seq_idx in 0..batch.num_sequences() {
+                let start = batch.cu_seqlens[seq_idx] as usize;
+                let end = batch.cu_seqlens[seq_idx + 1] as usize;
+                let seq_len = end.saturating_sub(start);
+                for local_pos in 0..seq_len {
+                    let t = start + local_pos;
+                    let pos_f = local_pos as f32;
+                    let q_tok = &mut q[t * q_dim..(t + 1) * q_dim];
+                    let k_tok = &mut k[t * kv_dim..(t + 1) * kv_dim];
+                    for i in 0..half {
+                        let (sin_a, cos_a) = (pos_f * inv_freq[i]).sin_cos();
+                        for h in 0..n_heads {
+                            let base = h * hd;
+                            let x0 = q_tok[base + i];
+                            let x1 = q_tok[base + half + i];
+                            q_tok[base + i] = x0 * cos_a - x1 * sin_a;
+                            q_tok[base + half + i] = x1 * cos_a + x0 * sin_a;
+                        }
+                        for h in 0..n_kv {
+                            let base = h * hd;
+                            let x0 = k_tok[base + i];
+                            let x1 = k_tok[base + half + i];
+                            k_tok[base + i] = x0 * cos_a - x1 * sin_a;
+                            k_tok[base + half + i] = x1 * cos_a + x0 * sin_a;
+                        }
+                    }
+                }
+            }
+
+            // Block-diagonal FlashAttention per sequence span [start..end)
+            let softcap = self.cfg.attn_logit_softcapping;
+            let sliding_win = layer.sliding_window;
             for seq_idx in 0..batch.num_sequences() {
                 let start = batch.cu_seqlens[seq_idx] as usize;
                 let end = batch.cu_seqlens[seq_idx + 1] as usize;
@@ -906,21 +1222,20 @@ impl Gemma2Embedder {
                     continue;
                 }
 
-                for local_pos in 0..seq_len {
-                    let t = start + local_pos;
-                    self.apply_rope_token(&mut q[t * q_dim..(t + 1) * q_dim], n_heads, local_pos);
-                    self.apply_rope_token(&mut k[t * kv_dim..(t + 1) * kv_dim], n_kv, local_pos);
-                }
-
                 let mut scores = vec![0.0f32; seq_len];
                 for local_t in 0..seq_len {
                     let t = start + local_t;
+                    let (s_lo, s_hi) = if let Some(win) = sliding_win {
+                        (local_t.saturating_sub(win), (local_t + win + 1).min(seq_len))
+                    } else {
+                        (0, seq_len)
+                    };
                     for h in 0..n_heads {
                         let kv_h = h / gqa_group;
                         let q_slice = &q[t * q_dim + h * hd..t * q_dim + (h + 1) * hd];
 
                         let mut max_score = f32::NEG_INFINITY;
-                        for local_s in 0..seq_len {
+                        for local_s in s_lo..s_hi {
                             let s = start + local_s;
                             let k_slice =
                                 &k[s * kv_dim + kv_h * hd..s * kv_dim + (kv_h + 1) * hd];
@@ -929,7 +1244,7 @@ impl Gemma2Embedder {
                                 dot += q_slice[c] * k_slice[c];
                             }
                             let mut sc = dot * attn_scale;
-                            if let Some(cap) = self.cfg.attn_logit_softcapping {
+                            if let Some(cap) = softcap {
                                 sc = (sc / cap).tanh() * cap;
                             }
                             scores[local_s] = sc;
@@ -939,7 +1254,7 @@ impl Gemma2Embedder {
                         }
 
                         let mut exp_sum = 0.0f32;
-                        for local_s in 0..seq_len {
+                        for local_s in s_lo..s_hi {
                             let e = (scores[local_s] - max_score).exp();
                             scores[local_s] = e;
                             exp_sum += e;
@@ -948,7 +1263,7 @@ impl Gemma2Embedder {
 
                         let out_slice =
                             &mut attn_out[t * q_dim + h * hd..t * q_dim + (h + 1) * hd];
-                        for local_s in 0..seq_len {
+                        for local_s in s_lo..s_hi {
                             let s = start + local_s;
                             let w = scores[local_s] * inv_sum;
                             let v_slice =
@@ -969,19 +1284,66 @@ impl Gemma2Embedder {
                 d,
                 q_dim,
             );
-            for i in 0..hidden.len() {
-                hidden[i] += proj_attn[i];
+            if layer.pre_feedforward_layernorm.is_some() {
+                let post_attn = self.apply_rms_norm(&proj_attn, &layer.post_attention_layernorm);
+                for i in 0..hidden.len() {
+                    hidden[i] += post_attn[i];
+                }
+            } else {
+                for i in 0..hidden.len() {
+                    hidden[i] += proj_attn[i];
+                }
             }
 
-            let post_norm = self.apply_rms_norm(&hidden, &layer.post_attention_layernorm);
-            gemm_nt_f32(&post_norm, &layer.gate_proj, &mut gate, total_tokens, inter, d);
-            gemm_nt_f32(&post_norm, &layer.up_proj, &mut up, total_tokens, inter, d);
+            let ffn_in = if let Some(ref pre_ffn) = layer.pre_feedforward_layernorm {
+                self.apply_rms_norm(&hidden, pre_ffn)
+            } else {
+                self.apply_rms_norm(&hidden, &layer.post_attention_layernorm)
+            };
+            gemm_nt_f32(&ffn_in, &layer.gate_proj, &mut gate, total_tokens, inter, d);
+            gemm_nt_f32(&ffn_in, &layer.up_proj, &mut up, total_tokens, inter, d);
             for i in 0..gate.len() {
                 gate[i] = gelu_tanh(gate[i]) * up[i];
             }
             gemm_nt_f32(&gate, &layer.down_proj, &mut mlp_out, total_tokens, d, inter);
-            for i in 0..hidden.len() {
-                hidden[i] += mlp_out[i];
+
+            if let Some(ref post_ffn) = layer.post_feedforward_layernorm {
+                let mlp_normed = self.apply_rms_norm(&mlp_out, post_ffn);
+                for i in 0..hidden.len() {
+                    hidden[i] += mlp_normed[i];
+                }
+            } else {
+                for i in 0..hidden.len() {
+                    hidden[i] += mlp_out[i];
+                }
+            }
+
+            // Per-Layer Embedding (`EmbeddingGemma2TextPLEBlock`) residual sub-block
+            if let (
+                Some(ref ple_all),
+                Some(ref gate_w),
+                Some(ref proj_w),
+                Some(ref norm_w),
+            ) = (
+                &ple_normed,
+                &layer.ple_input_gate,
+                &layer.ple_projection,
+                &layer.ple_post_norm,
+            ) {
+                gemm_nt_f32(&hidden, gate_w, &mut ple_gate, total_tokens, d, d);
+                for t in 0..total_tokens {
+                    let ple_slice =
+                        &ple_all[(t * num_layers + l_idx) * d..(t * num_layers + l_idx + 1) * d];
+                    let g_row = &mut ple_gate[t * d..(t + 1) * d];
+                    for c in 0..d {
+                        g_row[c] = gelu_tanh(g_row[c]) * ple_slice[c];
+                    }
+                }
+                gemm_nt_f32(&ple_gate, proj_w, &mut ple_proj, total_tokens, d, d);
+                let ple_out = self.apply_rms_norm(&ple_proj, norm_w);
+                for i in 0..hidden.len() {
+                    hidden[i] = (hidden[i] + ple_out[i]) * layer.layer_scalar;
+                }
             }
         }
 
@@ -1012,6 +1374,69 @@ impl Gemma2Embedder {
         }
         pooled
     }
+
+    /// Single-pass fused ingestion + 768-d vector extraction: runs the 24-layer ragged
+    /// forward pass ONCE, multiplies by the offline-folded `w_proj_augmented` (`[960, 512]`),
+    /// encodes `out_blocks` with zero runtime FWHT, and returns the exact 768-d vectors
+    /// (rows `0..768` of `w_proj_augmented`).
+    pub fn embed_and_ingest_packed(
+        &self,
+        batch: PackedTokenBatch<'_>,
+        timestamps: &[u32],
+        sources: &[u32],
+        out_blocks: &mut [PaxBlock64],
+    ) -> Vec<[f32; EMBED_DIMS_768]> {
+        let b = batch.num_sequences();
+        if b == 0 {
+            return Vec::new();
+        }
+        assert_eq!(timestamps.len(), b);
+        assert_eq!(sources.len(), b);
+        let expected_blocks = (b + VECTORS_PER_BLOCK - 1) / VECTORS_PER_BLOCK;
+        assert!(out_blocks.len() >= expected_blocks);
+
+        let d = self.cfg.hidden_size;
+        let normed_hidden = self.forward_ragged_layers(batch, self.cfg.num_hidden_layers);
+        let pooled = self.mean_pool_ragged(&normed_hidden, batch);
+
+        let mut aug_flat = vec![0.0f32; b * AUGMENTED_FULL_DIMS];
+        gemm_nt_f32(
+            &pooled,
+            &self.w_proj_augmented,
+            &mut aug_flat,
+            b,
+            AUGMENTED_FULL_DIMS,
+            d,
+        );
+
+        let mut aug_vecs = Vec::with_capacity(b);
+        let mut base_vecs = Vec::with_capacity(b);
+        for i in 0..b {
+            let slice = &aug_flat[i * AUGMENTED_FULL_DIMS..(i + 1) * AUGMENTED_FULL_DIMS];
+            let mut n2 = 0.0f32;
+            for &x in &slice[..EMBED_DIMS_768] {
+                n2 += x * x;
+            }
+            let inv_norm = 1.0 / n2.sqrt().max(1e-12);
+            let mut arr = [0.0f32; AUGMENTED_FULL_DIMS];
+            for c in 0..AUGMENTED_FULL_DIMS {
+                arr[c] = slice[c] * inv_norm;
+            }
+            let mut v768 = [0.0f32; EMBED_DIMS_768];
+            v768.copy_from_slice(&arr[..EMBED_DIMS_768]);
+            aug_vecs.push(arr);
+            base_vecs.push(v768);
+        }
+
+        for (blk_idx, chunk) in aug_vecs.chunks(VECTORS_PER_BLOCK).enumerate() {
+            let base = blk_idx * VECTORS_PER_BLOCK;
+            let end = base + chunk.len();
+            out_blocks[blk_idx] =
+                encode_block_from_augmented(chunk, &timestamps[base..end], &sources[base..end]);
+        }
+
+        base_vecs
+    }
 }
 
 #[inline]
@@ -1036,6 +1461,51 @@ fn l2_normalize_slice(v: &mut [f32]) -> f32 {
 
 impl UnifiedEmbedder for Gemma2Embedder {
     fn tokenize_u32(&self, text: &str) -> Vec<u32> {
+        // When BPE merges from `tokenizer.json` are loaded, run exact SentencePiece BPE!
+        if !self.bpe_merges.is_empty() && !self.vocab_map.is_empty() {
+            let normalized = text.replace(' ', "\u{2581}");
+            let unk_id = self.vocab_map.get("<unk>").copied().unwrap_or(3);
+            let mut ids: Vec<u32> = Vec::with_capacity(normalized.len() + 2);
+            let mut ch_buf = [0u8; 4];
+            for ch in normalized.chars() {
+                let s = ch.encode_utf8(&mut ch_buf);
+                if let Some(&id) = self.vocab_map.get(s) {
+                    ids.push(id);
+                } else {
+                    for &b in s.as_bytes() {
+                        let hex = format!("<0x{b:02X}>");
+                        ids.push(self.vocab_map.get(&hex).copied().unwrap_or(unk_id));
+                    }
+                }
+            }
+
+            while ids.len() >= 2 {
+                let mut best_rank = u32::MAX;
+                let mut best_idx = usize::MAX;
+                let mut best_merged = 0u32;
+                for i in 0..(ids.len() - 1) {
+                    if let Some(&(rank, merged_id)) = self.bpe_merges.get(&(ids[i], ids[i + 1])) {
+                        if rank < best_rank {
+                            best_rank = rank;
+                            best_idx = i;
+                            best_merged = merged_id;
+                        }
+                    }
+                }
+                if best_idx == usize::MAX {
+                    break;
+                }
+                ids[best_idx] = best_merged;
+                ids.remove(best_idx + 1);
+            }
+
+            let mut out = Vec::with_capacity(ids.len() + 2);
+            out.push(2); // <bos>
+            out.extend_from_slice(&ids);
+            out.push(1); // <eos>
+            return out;
+        }
+
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -1063,8 +1533,53 @@ impl UnifiedEmbedder for Gemma2Embedder {
     }
 
     fn begin_query(&self, query_text: &str) -> QuerySession {
-        let user_tokens = self.tokenize_u32(query_text);
         let d = self.cfg.hidden_size;
+
+        // When running with official EmbeddingGemma2TextModel (`ple_model_proj.is_some()`),
+        // run the exact bidirectional encoder over the full prompted query `[prefix; query]`
+        // so query embeddings are 100.0% identical to `google/embeddinggemma-2`.
+        if self.ple_model_proj.is_some() {
+            let full_query = format!("{DEFAULT_QUERY_TASK_PREFIX}{query_text}");
+            let tokens = self.tokenize_u32(&full_query);
+            let cu_seqlens = [0u32, tokens.len() as u32];
+            let batch = PackedTokenBatch {
+                tokens: &tokens,
+                cu_seqlens: &cu_seqlens,
+            };
+
+            let early_normed = self.forward_ragged_layers(batch, self.cfg.early_exit_layer);
+            let pooled_early = self.mean_pool_ragged(&early_normed, batch);
+            let mut query_early_64 = [0.0f32; MRL_PREFIX_DIMS];
+            gemm_nt_f32(
+                &pooled_early,
+                &self.w_early_64,
+                &mut query_early_64,
+                1,
+                MRL_PREFIX_DIMS,
+                d,
+            );
+            l2_normalize_slice(&mut query_early_64);
+
+            let final_normed = self.forward_ragged_layers(batch, self.cfg.num_hidden_layers);
+            let pooled_final = self.mean_pool_ragged(&final_normed, batch);
+            let mut query_f32 = [0.0f32; EMBED_DIMS_768];
+            gemm_nt_f32(
+                &pooled_final,
+                &self.w_proj,
+                &mut query_f32,
+                1,
+                EMBED_DIMS_768,
+                d,
+            );
+            l2_normalize_slice(&mut query_f32);
+
+            return QuerySession {
+                query_f32,
+                query_early_64,
+            };
+        }
+
+        let user_tokens = self.tokenize_u32(query_text);
         let seq_len = user_tokens.len();
 
         let mut hidden = self.lookup_tokens(&user_tokens);
@@ -1420,5 +1935,42 @@ mod tests {
         let top2 = model.score_shortlist_packed(&session, batch, &priors, 2);
         assert_eq!(top2.len(), 2);
         assert!(top2[0].1 >= top2[1].1);
+    }
+
+    #[test]
+    fn real_hf_embeddinggemma2_snapshot_matches_pytorch_reference() {
+        let snap = Path::new(
+            "/Users/tim/.cache/huggingface/hub/models--google--embeddinggemma-2/snapshots/914f7f89142e33e77833254d9c9b90c3cef7303b",
+        );
+        if !snap.exists() {
+            return;
+        }
+        let model =
+            Gemma2Embedder::from_hf_snapshot_dir(snap).expect("load real google/embeddinggemma-2");
+        let toks = model.tokenize_u32("title: none | text: hello world");
+        assert_eq!(
+            toks,
+            vec![2, 3250, 236787, 7293, 1109, 1816, 236787, 29104, 1902, 1]
+        );
+
+        let vecs = model.embed(&["title: none | text: hello world".to_string()]);
+        let v = &vecs[0];
+        let expected_first8 = [
+            -0.030133624f32,
+            0.015779221,
+            0.058494147,
+            -0.006499115,
+            -0.034399293,
+            0.052333385,
+            0.009479246,
+            0.023146160,
+        ];
+        for (i, (&got, &exp)) in v[..8].iter().zip(expected_first8.iter()).enumerate() {
+            let diff = (got - exp).abs();
+            assert!(
+                diff < 1e-4,
+                "coord {i} mismatch vs PyTorch reference: got {got}, expected {exp} (diff {diff})"
+            );
+        }
     }
 }
