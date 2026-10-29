@@ -57,6 +57,15 @@ struct RawQrel {
 }
 
 #[derive(Debug, Serialize)]
+struct BatchThroughputRow {
+    batch_size: usize,
+    query_ms_per_item: f64,
+    queries_per_sec: f64,
+    passage_ms_per_item: f64,
+    passages_per_sec: f64,
+}
+
+#[derive(Debug, Serialize)]
 struct ShortlistEvalRow {
     shortlist: usize,
     scan_ms_per_query: f64,
@@ -74,6 +83,17 @@ struct ShortlistEvalRow {
 #[derive(Debug, Serialize)]
 struct LiveBenchReport {
     model: String,
+    compute_unit: String,
+    dtype: String,
+    weights_dtype: String,
+    reference_dtype: String,
+    batch_size: usize,
+    ingest_batch_size: usize,
+    query_batch_size: usize,
+    strata: String,
+    stratum4_weight: f32,
+    cs_tolerance: f32,
+    rerank_mode: String,
     dataset: String,
     n_passages_embedded: usize,
     n_queries_embedded: usize,
@@ -87,11 +107,15 @@ struct LiveBenchReport {
     single_query_embed_ms: f64,
     fused_paxblock_crc_verified_blocks: usize,
     fused_vs_unfused_bit_identical_blocks: usize,
+    fused_ingest_vs_unfused_query_bit_identical_queries: usize,
     mean_doc_cosine_vs_pytorch_ref: f64,
+    min_doc_cosine_vs_pytorch_ref: f64,
     mean_query_cosine_vs_pytorch_ref: f64,
+    min_query_cosine_vs_pytorch_ref: f64,
     oracle_qrels_recall_at_10: f64,
     oracle_qrels_ndcg_at_10: f64,
     oracle_qrels_mrr_at_10: f64,
+    batched_throughput: Vec<BatchThroughputRow>,
     shortlist_grid: Vec<ShortlistEvalRow>,
 }
 
@@ -280,6 +304,7 @@ fn main() {
     );
     let n_blocks = n_passages / VECTORS_PER_BLOCK;
     let mut pax_blocks = vec![PaxBlock64::zeroed(); n_blocks];
+    let mut pax_blocks_unfused = vec![PaxBlock64::zeroed(); n_blocks];
     let mut corpus_vecs: Vec<[f32; 768]> = Vec::with_capacity(n_passages);
     let mut crc_ok_blocks = 0usize;
     let mut bit_identical_blocks = 0usize;
@@ -323,6 +348,7 @@ fn main() {
         }
 
         pax_blocks[blk_idx] = blk_fused;
+        pax_blocks_unfused[blk_idx] = blk_unfused;
         corpus_vecs.extend_from_slice(&vecs64);
 
         if (blk_idx + 1) % 16 == 0 || blk_idx + 1 == n_blocks {
@@ -342,7 +368,7 @@ fn main() {
     let corpus_embed_and_index_s = t_embed.elapsed().as_secs_f64();
     let passages_per_sec = (n_passages as f64) / corpus_embed_and_index_s.max(1e-6);
 
-    // Measure single-query cold/warm latency over 8 sample queries
+    // Measure single-query warm latency over 8 sample queries
     let sample_n = queries.len().min(8);
     let t_sq = Instant::now();
     for q in &queries[..sample_n] {
@@ -365,49 +391,104 @@ fn main() {
         single_query_embed_ms
     );
 
+    // Measure explicit batch throughput table across batch = 1, 8, 32, 64 (on 64 queries & 64 passages)
+    let bench_n = 64usize.min(queries.len()).min(n_passages);
+    let mut batched_throughput = Vec::new();
+    for &bs in &[1usize, 8, 32, 64] {
+        if bs > bench_n {
+            continue;
+        }
+        let t_bq = Instant::now();
+        for chunk in query_refs[..bench_n].chunks(bs) {
+            let _ = embedder.begin_queries_batch(chunk);
+        }
+        let q_el = t_bq.elapsed().as_secs_f64();
+        let q_ms = (q_el * 1000.0) / (bench_n as f64);
+        let q_ps = (bench_n as f64) / q_el.max(1e-6);
+
+        let t_bd = Instant::now();
+        let ts_dummy = vec![1_700_000_000u32; bs];
+        let src_dummy = vec![source::DOC; bs];
+        let mut blk_dummy = [PaxBlock64::zeroed(); 1];
+        for chunk in all_tokens_per_doc[..bench_n].chunks(bs) {
+            let mut flat = Vec::with_capacity(bs * 96);
+            let mut cu = Vec::with_capacity(chunk.len() + 1);
+            cu.push(0u32);
+            for toks in chunk {
+                flat.extend_from_slice(toks);
+                cu.push(flat.len() as u32);
+            }
+            let packed = PackedTokenBatch {
+                tokens: &flat,
+                cu_seqlens: &cu,
+            };
+            let _ = embedder.embed_and_ingest_packed(
+                packed,
+                &ts_dummy[..chunk.len()],
+                &src_dummy[..chunk.len()],
+                &mut blk_dummy,
+            );
+        }
+        let d_el = t_bd.elapsed().as_secs_f64();
+        let d_ms = (d_el * 1000.0) / (bench_n as f64);
+        let d_ps = (bench_n as f64) / d_el.max(1e-6);
+
+        batched_throughput.push(BatchThroughputRow {
+            batch_size: bs,
+            query_ms_per_item: q_ms,
+            queries_per_sec: q_ps,
+            passage_ms_per_item: d_ms,
+            passages_per_sec: d_ps,
+        });
+    }
+
     // Audit cosine similarity against PyTorch A100 reference embeddings if present
-    let mean_doc_cos = if let Some(ref_docs) =
+    let (mean_doc_cos, min_doc_cos) = if let Some(ref_docs) =
         load_f32_bin(&data_dir.join("embeddings.bin"), n_passages, 768)
     {
-        let sum: f64 = corpus_vecs
-            .iter()
-            .zip(ref_docs.iter())
-            .map(|(a, b)| {
-                let mut b_norm = *b;
-                let n = b_norm.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-                for x in &mut b_norm {
-                    *x /= n;
-                }
-                dot_768(a, &b_norm) as f64
-            })
-            .sum();
-        sum / (n_passages as f64)
+        let mut sum = 0.0f64;
+        let mut min_c = 1.0f64;
+        for (a, b) in corpus_vecs.iter().zip(ref_docs.iter()) {
+            let mut b_norm = *b;
+            let n = b_norm.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            for x in &mut b_norm {
+                *x /= n;
+            }
+            let c = dot_768(a, &b_norm) as f64;
+            sum += c;
+            if c < min_c {
+                min_c = c;
+            }
+        }
+        (sum / (n_passages as f64), min_c)
     } else {
-        1.0
+        (1.0, 1.0)
     };
 
-    let mean_q_cos = if let Some(ref_qs) =
+    let (mean_q_cos, min_q_cos) = if let Some(ref_qs) =
         load_f32_bin(&data_dir.join("query_embeddings.bin"), queries.len(), 768)
     {
-        let sum: f64 = query_vecs
-            .iter()
-            .zip(ref_qs.iter())
-            .map(|(a, b)| {
-                let mut b_norm = *b;
-                let n = b_norm.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-                for x in &mut b_norm {
-                    *x /= n;
-                }
-                dot_768(a, &b_norm) as f64
-            })
-            .sum();
-        sum / (queries.len() as f64)
+        let mut sum = 0.0f64;
+        let mut min_c = 1.0f64;
+        for (a, b) in query_vecs.iter().zip(ref_qs.iter()) {
+            let mut b_norm = *b;
+            let n = b_norm.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            for x in &mut b_norm {
+                *x /= n;
+            }
+            let c = dot_768(a, &b_norm) as f64;
+            sum += c;
+            if c < min_c {
+                min_c = c;
+            }
+        }
+        (sum / (queries.len() as f64), min_c)
     } else {
-        1.0
+        (1.0, 1.0)
     };
     println!(
-        "   Fidelity vs PyTorch A100 reference: docs cosine = {:.6}, queries cosine = {:.6}",
-        mean_doc_cos, mean_q_cos
+        "   Fidelity vs PyTorch A100 reference: docs cosine mean={:.6} (min={:.6}), queries cosine mean={:.6} (min={:.6})",
+        mean_doc_cos, min_doc_cos, mean_q_cos, min_q_cos
     );
 
     // Step 5: Compute exact brute-force ground truth over our live-embedded vectors + Oracle qrels
@@ -440,6 +521,7 @@ fn main() {
     let oracle_qrels_ndcg_at_10 = oracle_ndcg10_sum / (n_qrels_eval.max(1) as f64);
     let oracle_qrels_mrr_at_10 = oracle_mrr10_sum / (n_qrels_eval.max(1) as f64);
 
+    let mut fused_ingest_vs_unfused_query_bit_identical_queries = 0usize;
     let mut shortlist_grid = Vec::new();
     for &sl in &[64usize, 256, 512, 1024] {
         if sl > n_passages {
@@ -447,7 +529,7 @@ fn main() {
         }
         let mut cfg = EngineConfig::default();
         cfg.embed_dims = 768;
-        cfg.strata_depth = StrataDepth::Full64b;
+        cfg.strata_depth = StrataDepth::L1Rabitq;
         cfg.shortlist_cand = sl;
         cfg.final_top_k = 10;
 
@@ -471,6 +553,22 @@ fn main() {
             }
             let scanned = shortlist.into_sorted();
             scan_ms_sum += t_s.elapsed().as_secs_f64() * 1000.0;
+
+            if sl == 64 {
+                let mut shortlist_unfused = Shortlist::new(sl);
+                for hit in scan_blocks(&pax_blocks_unfused, &plan, &cfg, None, None) {
+                    shortlist_unfused.push(hit);
+                }
+                let scanned_unfused = shortlist_unfused.into_sorted();
+                let same = scanned.len() == scanned_unfused.len()
+                    && scanned
+                        .iter()
+                        .zip(scanned_unfused.iter())
+                        .all(|(a, b)| a.id == b.id && a.score.to_bits() == b.score.to_bits());
+                if same {
+                    fused_ingest_vs_unfused_query_bit_identical_queries += 1;
+                }
+            }
 
             let cand_ids_u64: Vec<u64> = scanned
                 .iter()
@@ -558,8 +656,20 @@ fn main() {
         shortlist_grid.push(row);
     }
 
+    let default_cfg = EngineConfig::default();
     let report = LiveBenchReport {
         model: "google/embeddinggemma-2 (local Rust + Apple Silicon Accelerate AMX)".into(),
+        compute_unit: "CPU + Apple Silicon AMX (Accelerate.framework cblas_sgemm + vForce vvtanhf + Rayon; no CoreML/ANE, no Metal GPU dispatch)".into(),
+        dtype: "fp32 (activations, RMSNorm, RoPE, attention, MLP, and final 768-d embeddings)".into(),
+        weights_dtype: "bf16 on disk (model.safetensors, 622 MB) -> dequantized to fp32 in RAM at load".into(),
+        reference_dtype: "bf16 forward pass on NVIDIA A100-SXM4-40GB -> stored as fp32 in embeddings.bin".into(),
+        batch_size: VECTORS_PER_BLOCK,
+        ingest_batch_size: VECTORS_PER_BLOCK,
+        query_batch_size: queries.len(),
+        strata: "l1_rabitq".into(),
+        stratum4_weight: default_cfg.stratum4_weight,
+        cs_tolerance: default_cfg.cs_tolerance,
+        rerank_mode: "in_memory_dot_768 (bench harness caches live-embedded [f32; 768] in RAM for fast multi-shortlist sweep; IndexEngine::query uses zero-f32-storage JIT re-embed over packed u32 token spans)".into(),
         dataset: format!("BeIR/msmarco ({} passages, {} queries)", n_passages, queries.len()),
         n_passages_embedded: n_passages,
         n_queries_embedded: queries.len(),
@@ -573,11 +683,15 @@ fn main() {
         single_query_embed_ms,
         fused_paxblock_crc_verified_blocks: crc_ok_blocks,
         fused_vs_unfused_bit_identical_blocks: bit_identical_blocks,
+        fused_ingest_vs_unfused_query_bit_identical_queries,
         mean_doc_cosine_vs_pytorch_ref: mean_doc_cos,
+        min_doc_cosine_vs_pytorch_ref: min_doc_cos,
         mean_query_cosine_vs_pytorch_ref: mean_q_cos,
+        min_query_cosine_vs_pytorch_ref: min_q_cos,
         oracle_qrels_recall_at_10,
         oracle_qrels_ndcg_at_10,
         oracle_qrels_mrr_at_10,
+        batched_throughput,
         shortlist_grid,
     };
 

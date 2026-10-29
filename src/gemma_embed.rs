@@ -827,6 +827,60 @@ impl Gemma2Embedder {
         Self::from_safetensors_bytes(cfg, &mmap)
     }
 
+    /// Locate the local `google/embeddinggemma-2` Hugging Face snapshot directory.
+    ///
+    /// Resolution order:
+    /// 1. Explicit `override_dir` if provided.
+    /// 2. `GEMMA2_SNAPSHOT` environment variable if set.
+    /// 3. `$HF_HOME/hub/models--google--embeddinggemma-2/snapshots/<rev>` or
+    ///    `$HOME/.cache/huggingface/hub/models--google--embeddinggemma-2/snapshots/<rev>`.
+    pub fn find_default_hf_snapshot(override_dir: Option<&Path>) -> Result< std::path::PathBuf, String> {
+        if let Some(p) = override_dir {
+            if p.join("model.safetensors").exists() {
+                return Ok(p.to_path_buf());
+            }
+            return Err(format!(
+                "google/embeddinggemma-2 model.safetensors not found at {}",
+                p.display()
+            ));
+        }
+        if let Ok(env_p) = std::env::var("GEMMA2_SNAPSHOT") {
+            let p = std::path::PathBuf::from(env_p);
+            if p.join("model.safetensors").exists() {
+                return Ok(p);
+            }
+            return Err(format!(
+                "GEMMA2_SNAPSHOT={} does not contain model.safetensors",
+                p.display()
+            ));
+        }
+        let hub_root = if let Ok(hf_home) = std::env::var("HF_HOME") {
+            std::path::PathBuf::from(hf_home).join("hub")
+        } else {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/tim".into());
+            std::path::PathBuf::from(home).join(".cache/huggingface/hub")
+        };
+        let snaps_dir = hub_root.join("models--google--embeddinggemma-2/snapshots");
+        if let Ok(entries) = std::fs::read_dir(&snaps_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.join("model.safetensors").exists() {
+                    return Ok(p);
+                }
+            }
+        }
+        Err(format!(
+            "google/embeddinggemma-2 checkpoint not found under {}; set GEMMA2_SNAPSHOT=/path/to/snapshot or run:\n  huggingface-cli download google/embeddinggemma-2 model.safetensors tokenizer.json config.json",
+            snaps_dir.display()
+        ))
+    }
+
+    /// Load `google/embeddinggemma-2` from `override_dir`, `GEMMA2_SNAPSHOT`, or the local Hugging Face cache.
+    pub fn from_default_or_path(override_dir: Option<&Path>) -> Result<Self, String> {
+        let dir = Self::find_default_hf_snapshot(override_dir)?;
+        Self::from_hf_snapshot_dir(&dir)
+    }
+
     /// Load the real `google/embeddinggemma-2` checkpoint directory (`model.safetensors` + `tokenizer.json`),
     /// folding the 768-d projection + FWHT matrices offline into `w_proj_augmented` (`[960, 512]`).
     pub fn from_hf_snapshot_dir(dir: impl AsRef<Path>) -> Result<Self, String> {

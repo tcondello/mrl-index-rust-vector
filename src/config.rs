@@ -57,6 +57,9 @@ pub struct EngineConfig {
     pub embed_dims: usize,
     pub mrl_prefix: usize,
     pub final_top_k: usize,
+    /// Opt-in flag to use local `google/embeddinggemma-2` (768-d) instead of the default demo `HashingEmbedder`.
+    #[serde(default)]
+    pub use_gemma2: bool,
 }
 
 impl Default for EngineConfig {
@@ -78,6 +81,7 @@ impl Default for EngineConfig {
             embed_dims: 384,
             mrl_prefix: 64,
             final_top_k: 10,
+            use_gemma2: false,
         }
     }
 }
@@ -97,6 +101,9 @@ impl EngineConfig {
         }
         if self.embed_dims < 192 {
             return Err("embed_dims must be >= 192 (prefix 64 + mid 128)".into());
+        }
+        if self.use_gemma2 && self.embed_dims != 768 {
+            return Err("use_gemma2 (--gemma2) requires embed_dims == 768".into());
         }
         if self.mrl_prefix != 64 {
             return Err("mrl_prefix must be 64 for PaxBlock64 layout".into());

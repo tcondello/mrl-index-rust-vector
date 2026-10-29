@@ -7,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use mrl_index::block::source;
 use mrl_index::config::{EngineConfig, SlabResidency, StrataDepth};
+use mrl_index::gemma_embed::Gemma2Embedder;
 use mrl_index::IndexEngine;
 
 #[derive(Parser, Debug)]
@@ -21,12 +22,15 @@ enum Cmd {
     /// Create a new index directory.
     Init {
         dir: PathBuf,
-        #[arg(long, default_value_t = 384)]
-        dims: usize,
+        #[arg(long)]
+        dims: Option<usize>,
         #[arg(long, default_value = "l1_rabitq")]
         strata: String,
         #[arg(long, default_value_t = 64)]
         shortlist: usize,
+        /// Opt-in to local `google/embeddinggemma-2` (768-d) instead of the default demo `HashingEmbedder`.
+        #[arg(long)]
+        gemma2: bool,
     },
     /// Append a text passage (or lines from --file).
     Ingest {
@@ -41,6 +45,12 @@ enum Cmd {
         timestamp: u32,
         #[arg(long)]
         flush: bool,
+        /// Opt-in to local `google/embeddinggemma-2` (768-d) + fused `PaxBlock64` ingestion.
+        #[arg(long)]
+        gemma2: bool,
+        /// Optional path to `google/embeddinggemma-2` snapshot dir (overrides `GEMMA2_SNAPSHOT` / HF cache).
+        #[arg(long)]
+        gemma2_snapshot: Option<PathBuf>,
     },
     /// Run a retrieval query.
     Query {
@@ -50,6 +60,12 @@ enum Cmd {
         time_lo: Option<u32>,
         #[arg(long)]
         time_hi: Option<u32>,
+        /// Opt-in to local `google/embeddinggemma-2` (768-d) + `u32` token shortlist reranking.
+        #[arg(long)]
+        gemma2: bool,
+        /// Optional path to `google/embeddinggemma-2` snapshot dir (overrides `GEMMA2_SNAPSHOT` / HF cache).
+        #[arg(long)]
+        gemma2_snapshot: Option<PathBuf>,
     },
     /// Synthetic end-to-end demo (ingest + query + timings).
     Demo {
@@ -57,8 +73,14 @@ enum Cmd {
         dir: PathBuf,
         #[arg(long, default_value_t = 2_048)]
         docs: usize,
-        #[arg(long, default_value_t = 384)]
-        dims: usize,
+        #[arg(long)]
+        dims: Option<usize>,
+        /// Opt-in to local `google/embeddinggemma-2` (768-d) instead of the default demo `HashingEmbedder`.
+        #[arg(long)]
+        gemma2: bool,
+        /// Optional path to `google/embeddinggemma-2` snapshot dir (overrides `GEMMA2_SNAPSHOT` / HF cache).
+        #[arg(long)]
+        gemma2_snapshot: Option<PathBuf>,
     },
     /// Micro-benchmark scan throughput on synthetic blocks.
     Bench {
@@ -170,13 +192,24 @@ fn main() -> Result<()> {
             dims,
             strata,
             shortlist,
+            gemma2,
         } => {
             let mut cfg = EngineConfig::default();
-            cfg.embed_dims = dims;
+            cfg.embed_dims = dims.unwrap_or(if gemma2 { 768 } else { 384 });
             cfg.strata_depth = parse_strata(&strata)?;
             cfg.shortlist_cand = shortlist;
+            cfg.use_gemma2 = gemma2;
             IndexEngine::create(&dir, cfg)?;
-            println!("initialized mrl-index at {}", dir.display());
+            println!(
+                "initialized mrl-index at {} (dims={}, embedder={})",
+                dir.display(),
+                dims.unwrap_or(if gemma2 { 768 } else { 384 }),
+                if gemma2 {
+                    "google/embeddinggemma-2"
+                } else {
+                    "hashing-demo"
+                }
+            );
         }
         Cmd::Ingest {
             dir,
@@ -185,8 +218,22 @@ fn main() -> Result<()> {
             source,
             timestamp,
             flush,
+            gemma2,
+            gemma2_snapshot,
         } => {
             let mut engine = IndexEngine::open(&dir)?;
+            if gemma2 || engine.config().use_gemma2 {
+                if engine.config().embed_dims != 768 {
+                    bail!(
+                        "--gemma2 requires a 768-d index (index at {} has embed_dims={}); initialize with `mrl-index init --gemma2`",
+                        dir.display(),
+                        engine.config().embed_dims
+                    );
+                }
+                let embedder = Gemma2Embedder::from_default_or_path(gemma2_snapshot.as_deref())
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                engine = engine.with_gemma2_embedder(embedder);
+            }
             let src = parse_source(&source);
             let mut n = 0usize;
             if let Some(t) = text {
@@ -196,6 +243,7 @@ fn main() -> Result<()> {
             if let Some(path) = file {
                 let body = std::fs::read_to_string(&path)
                     .with_context(|| format!("read {}", path.display()))?;
+                let mut batch_items: Vec<(String, u32, u32)> = Vec::new();
                 for (i, line) in body.lines().enumerate() {
                     let line = line.trim();
                     if line.is_empty() {
@@ -206,8 +254,11 @@ fn main() -> Result<()> {
                     } else {
                         timestamp
                     };
-                    engine.ingest(line.to_string(), ts, src)?;
-                    n += 1;
+                    batch_items.push((line.to_string(), ts, src));
+                }
+                n += batch_items.len();
+                if !batch_items.is_empty() {
+                    engine.ingest_batch(&batch_items)?;
                 }
             }
             if flush {
@@ -220,8 +271,22 @@ fn main() -> Result<()> {
             query,
             time_lo,
             time_hi,
+            gemma2,
+            gemma2_snapshot,
         } => {
-            let engine = IndexEngine::open(&dir)?;
+            let mut engine = IndexEngine::open(&dir)?;
+            if gemma2 || engine.config().use_gemma2 {
+                if engine.config().embed_dims != 768 {
+                    bail!(
+                        "--gemma2 requires a 768-d index (index at {} has embed_dims={})",
+                        dir.display(),
+                        engine.config().embed_dims
+                    );
+                }
+                let embedder = Gemma2Embedder::from_default_or_path(gemma2_snapshot.as_deref())
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                engine = engine.with_gemma2_embedder(embedder);
+            }
             let result = engine.query_filtered(&query, time_lo, time_hi)?;
             println!(
                 "query ok — total {:.2} ms (embed {:.2} | scan {:.2} | fetch {:.2} | rerank {:.2})  blocks={} shortlist={}",
@@ -245,8 +310,15 @@ fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::Demo { dir, docs, dims } => {
-            run_demo(dir, docs, dims)?;
+        Cmd::Demo {
+            dir,
+            docs,
+            dims,
+            gemma2,
+            gemma2_snapshot,
+        } => {
+            let resolved_dims = dims.unwrap_or(if gemma2 { 768 } else { 384 });
+            run_demo(dir, docs, resolved_dims, gemma2, gemma2_snapshot)?;
         }
         Cmd::Bench { blocks, dims } => {
             run_bench(blocks, dims)?;
@@ -440,7 +512,13 @@ fn demo_corpus(n: usize) -> Vec<(String, u32, u32)> {
         .collect()
 }
 
-fn run_demo(dir: PathBuf, docs: usize, dims: usize) -> Result<()> {
+fn run_demo(
+    dir: PathBuf,
+    docs: usize,
+    dims: usize,
+    gemma2: bool,
+    gemma2_snapshot: Option<PathBuf>,
+) -> Result<()> {
     if dir.exists() {
         std::fs::remove_dir_all(&dir)?;
     }
@@ -450,9 +528,22 @@ fn run_demo(dir: PathBuf, docs: usize, dims: usize) -> Result<()> {
     cfg.slab_residency = SlabResidency::RamLocked;
     cfg.shortlist_cand = 64;
     cfg.final_top_k = 5;
+    cfg.use_gemma2 = gemma2;
 
-    println!("mrl-index demo — {docs} docs, dims={dims}");
+    println!(
+        "mrl-index demo — {docs} docs, dims={dims}, embedder={}",
+        if gemma2 {
+            "google/embeddinggemma-2"
+        } else {
+            "hashing-demo"
+        }
+    );
     let mut engine = IndexEngine::create(&dir, cfg)?;
+    if gemma2 {
+        let embedder = Gemma2Embedder::from_default_or_path(gemma2_snapshot.as_deref())
+            .map_err(|e| anyhow::anyhow!(e))?;
+        engine = engine.with_gemma2_embedder(embedder);
+    }
 
     let corpus = demo_corpus(docs);
     let t_ing = Instant::now();
