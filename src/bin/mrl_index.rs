@@ -105,6 +105,21 @@ enum Cmd {
         #[arg(long, default_value_t = 1.0)]
         cs_tolerance: f32,
     },
+    /// Compare fp32 / fp16 / int8 shortlist rerank parity (Step 4).
+    BenchPrecisionRerank {
+        #[arg(long, default_value = "step4")]
+        label: String,
+        #[arg(long)]
+        out_dir: PathBuf,
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        queries: Option<usize>,
+        #[arg(long, default_value_t = 256)]
+        shortlist: usize,
+        #[arg(long, default_value = "l1_rabitq")]
+        strata: String,
+    },
     /// Encode PaxBlocks once; sweep query-side `stratum4_weight` × `cs_tolerance` × shortlist.
     BenchRetrievalSweep {
         #[arg(long, default_value = "sweep")]
@@ -316,6 +331,31 @@ fn main() -> Result<()> {
                 println!("wrote {}", path.display());
             }
         }
+        Cmd::BenchPrecisionRerank {
+            label,
+            out_dir,
+            data,
+            queries,
+            shortlist,
+            strata,
+        } => {
+            let strata = parse_strata(&strata)?;
+            std::fs::create_dir_all(&out_dir)?;
+            let reports = mrl_index::retrieval_bench::run_precision_rerank_bench(
+                &label, &data, queries, shortlist, strata,
+            )
+            .with_context(|| format!("precision bench from {}", data.display()))?;
+            let mut summary = Vec::new();
+            for report in &reports {
+                report.print_summary();
+                let path = out_dir.join(format!("{}.json", report.label));
+                std::fs::write(&path, report.to_json_pretty())?;
+                summary.push(serde_json::to_value(report)?);
+            }
+            let summary_path = out_dir.join("summary.json");
+            std::fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
+            println!("wrote {} + {}", reports.len(), summary_path.display());
+        }
         Cmd::BenchRetrievalSweep {
             label,
             out_dir,
@@ -349,14 +389,12 @@ fn main() -> Result<()> {
                 &w_s4,
                 &cs,
                 &label,
+                Some(out_dir.as_path()),
             )
             .with_context(|| format!("sweep from {}", data.display()))?;
             let mut summary = Vec::new();
-            for (i, report) in reports.iter().enumerate() {
-                let path = out_dir.join(format!("cell_{i:03}_{}.json", report.label));
-                std::fs::write(&path, report.to_json_pretty())?;
+            for report in &reports {
                 summary.push(serde_json::json!({
-                    "file": path.file_name().and_then(|s| s.to_str()),
                     "label": report.label,
                     "shortlist": report.shortlist,
                     "stratum4_weight": report.stratum4_weight,

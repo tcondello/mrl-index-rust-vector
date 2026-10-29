@@ -1,16 +1,47 @@
 //! Append-only ingestion ring buffer with 64-vector flush (spec §1, §5).
+//!
+//! Step 4: pending vectors may carry optional `fp16` / `int8` copies for
+//! bandwidth-light exact search before PaxBlock flush.
+
+use half::f16;
 
 use crate::block::{source, PaxBlock64, VECTORS_PER_BLOCK};
 use crate::embed::dot;
+use crate::lowprec::{Fp16Vec768, Int8Vec768, EMBED_DIMS_768};
 use crate::quantize::encode_block;
 
 #[derive(Debug, Clone)]
 pub struct PendingVector {
     pub passage_id: u64,
     pub embedding: Vec<f32>,
+    /// Optional `[f16; 768]` mirror for low-bandwidth ring search (Step 4).
+    pub embedding_f16: Option<Box<[f16; EMBED_DIMS_768]>>,
+    /// Optional symmetric int8 mirror (`codes` + scale).
+    pub embedding_i8: Option<Box<Int8Vec768>>,
     pub timestamp: u32,
     pub source: u32,
     pub text: String,
+}
+
+impl PendingVector {
+    pub fn new(passage_id: u64, embedding: Vec<f32>, timestamp: u32, source: u32, text: String) -> Self {
+        let (embedding_f16, embedding_i8) = if embedding.len() == EMBED_DIMS_768 {
+            let f16v = Fp16Vec768::from_f32(&embedding);
+            let i8v = Int8Vec768::from_f32(&embedding);
+            (Some(Box::new(f16v.data)), Some(Box::new(i8v)))
+        } else {
+            (None, None)
+        };
+        Self {
+            passage_id,
+            embedding,
+            embedding_f16,
+            embedding_i8,
+            timestamp,
+            source,
+            text,
+        }
+    }
 }
 
 #[derive(Debug)]

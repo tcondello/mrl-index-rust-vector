@@ -14,6 +14,7 @@ pub mod config;
 pub mod corpus;
 pub mod embed;
 pub mod engine;
+pub mod lowprec;
 pub mod passage;
 pub mod quantize;
 pub mod retrieval_bench;

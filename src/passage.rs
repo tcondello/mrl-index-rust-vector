@@ -1,11 +1,17 @@
-//! Binary length-prefixed passage store: `passages.bin` + packed `passages.idx` (spec §3.2).
+//! Binary length-prefixed passage store: `passages.bin` + packed `passages.idx`.
 //!
-//! Layout per record in `passages.bin`:
-//!   `[id: u64, timestamp: u32, source: u32, text_len: u32, meta_len: u32]` (24 B header)
-//!   followed by `text_bytes[text_len]` (raw UTF-8) and `meta_bytes[meta_len]`.
+//! ## v2 layout (Step 5)
+//! Record header (28 B):
+//!   `[id: u64, timestamp: u32, source: u32, text_len: u32, meta_len: u32,
+//!     token_len: u16, flags: u16]`
+//! Payload: `text_bytes[text_len]` + `meta_bytes[meta_len]` + `tokens[token_len] as u16 LE`.
 //!
-//! `PassageIndexEntry` stores `(text_offset: u64, text_len: u32)` pointing directly
-//! at `text_bytes` so `fetch_text` performs a single zero-parse `pread` (`read_at`).
+//! `PassageIndexEntry` (24 B) stores text + optional token span offsets so
+//! `fetch_tokens_many` can read compact `u16` IDs without touching UTF-8, while
+//! `fetch_many` / `fetch_text` still serve raw text for the final `top_k` hits.
+//!
+//! Segment / token slabs may be padded to Apple Silicon's 16 KiB VM page size
+//! via [`align_page`] / [`PAGE_ALIGN`].
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -17,17 +23,42 @@ use thiserror::Error;
 
 use crate::block::VectorId;
 
-const RECORD_HEADER_BYTES: u64 = 24;
-const AUTO_FLUSH_BYTES: usize = 256 * 1024;
+/// Apple Silicon VM page size (`4 × PaxBlock64`).
+pub const PAGE_ALIGN: usize = 16_384;
 
-#[repr(C, packed)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
-pub struct PassageIndexEntry {
-    pub file_offset: u64,
-    pub text_len: u32,
+/// Round `n` up to the next multiple of [`PAGE_ALIGN`].
+#[inline]
+pub fn align_page(n: usize) -> usize {
+    align(n, PAGE_ALIGN)
 }
 
-const _: () = assert!(std::mem::size_of::<PassageIndexEntry>() == 12);
+/// Generic power-of-two (or arbitrary) alignment helper.
+#[inline]
+pub fn align(n: usize, alignment: usize) -> usize {
+    debug_assert!(alignment > 0);
+    (n + alignment - 1) / alignment * alignment
+}
+
+const RECORD_HEADER_BYTES: u64 = 28;
+const AUTO_FLUSH_BYTES: usize = 256 * 1024;
+const INDEX_ENTRY_BYTES: usize = 24;
+
+/// Flag bit: record carries a non-empty token span.
+pub const FLAG_HAS_TOKENS: u16 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct PassageIndexEntry {
+    /// Absolute file offset of UTF-8 text bytes.
+    pub file_offset: u64,
+    pub text_len: u32,
+    /// Number of `u16` token IDs (0 = none).
+    pub token_len: u32,
+    /// Absolute file offset of the `u16` token span (0 if `token_len == 0`).
+    pub token_offset: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<PassageIndexEntry>() == INDEX_ENTRY_BYTES);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PassageRecord {
@@ -37,6 +68,9 @@ pub struct PassageRecord {
     pub source: u32,
     #[serde(default)]
     pub meta: serde_json::Value,
+    /// Optional pre-tokenized `u16` IDs (SentencePiece / BPE / hashing vocab).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<u16>,
 }
 
 #[derive(Debug, Error)]
@@ -51,6 +85,8 @@ pub enum PassageError {
     Missing(VectorId),
     #[error("corrupt index: entry {0}")]
     CorruptIndex(u64),
+    #[error("corrupt token span for passage {0}")]
+    CorruptTokens(u64),
 }
 
 pub struct PassageStore {
@@ -85,11 +121,15 @@ impl PassageStore {
         let mut idx_bytes = Vec::new();
         idx.seek(SeekFrom::Start(0))?;
         idx.read_to_end(&mut idx_bytes)?;
-        let n_entries = idx_bytes.len() / 12;
+        if idx_bytes.len() % INDEX_ENTRY_BYTES != 0 {
+            return Err(PassageError::CorruptIndex(u64::MAX));
+        }
+        let n_entries = idx_bytes.len() / INDEX_ENTRY_BYTES;
         let mut entries = Vec::with_capacity(n_entries);
         for i in 0..n_entries {
-            let start = i * 12;
-            let entry: PassageIndexEntry = *bytemuck::from_bytes(&idx_bytes[start..start + 12]);
+            let start = i * INDEX_ENTRY_BYTES;
+            let entry: PassageIndexEntry =
+                *bytemuck::from_bytes(&idx_bytes[start..start + INDEX_ENTRY_BYTES]);
             entries.push(entry);
         }
 
@@ -130,8 +170,31 @@ impl PassageStore {
         Ok(())
     }
 
+    /// Pad the data file to the next 16 KiB boundary (segment / token slab helper).
+    pub fn pad_to_page(&mut self) -> Result<(), PassageError> {
+        self.flush()?;
+        let cur = self.flushed_offset as usize;
+        let target = align_page(cur);
+        if target > cur {
+            let pad = vec![0u8; target - cur];
+            self.data.write_all(&pad)?;
+            self.flushed_offset = target as u64;
+        }
+        Ok(())
+    }
+
     /// Append a passage; returns the sequential passage id (= vector ordinal).
-    pub fn append(&mut self, mut record: PassageRecord) -> Result<u64, PassageError> {
+    pub fn append(&mut self, record: PassageRecord) -> Result<u64, PassageError> {
+        let tokens = record.tokens.clone();
+        self.append_with_tokens(record, &tokens)
+    }
+
+    /// Append with an explicit token span (preferred ingest path for Step 5).
+    pub fn append_with_tokens(
+        &mut self,
+        mut record: PassageRecord,
+        tokens: &[u16],
+    ) -> Result<u64, PassageError> {
         let id = self.entries.len() as u64;
         record.id = id;
 
@@ -151,6 +214,12 @@ impl PassageStore {
             serde_json::to_vec(&record.meta)?
         };
         let meta_len = meta_bytes.len() as u32;
+        let token_len = tokens.len() as u16;
+        let flags = if token_len > 0 {
+            FLAG_HAS_TOKENS
+        } else {
+            0
+        };
 
         self.unflushed_data.extend_from_slice(&id.to_le_bytes());
         self.unflushed_data
@@ -161,14 +230,29 @@ impl PassageStore {
             .extend_from_slice(&text_len.to_le_bytes());
         self.unflushed_data
             .extend_from_slice(&meta_len.to_le_bytes());
+        self.unflushed_data
+            .extend_from_slice(&token_len.to_le_bytes());
+        self.unflushed_data
+            .extend_from_slice(&flags.to_le_bytes());
         self.unflushed_data.extend_from_slice(text_bytes);
         if !meta_bytes.is_empty() {
             self.unflushed_data.extend_from_slice(&meta_bytes);
         }
+        let token_offset = if tokens.is_empty() {
+            0
+        } else {
+            let off = self.flushed_offset + self.unflushed_data.len() as u64;
+            for &t in tokens {
+                self.unflushed_data.extend_from_slice(&t.to_le_bytes());
+            }
+            off
+        };
 
         let entry = PassageIndexEntry {
             file_offset: text_offset,
             text_len,
+            token_len: tokens.len() as u32,
+            token_offset,
         };
         self.entries.push(entry);
         self.unflushed_idx
@@ -219,6 +303,51 @@ impl PassageStore {
         Ok(String::from_utf8(buf)?)
     }
 
+    /// Fetch pre-tokenized `u16` IDs for one passage (empty if none stored).
+    pub fn fetch_tokens(&self, id: u64) -> Result<Vec<u16>, PassageError> {
+        let entry = self.entry(id)?;
+        if entry.token_len == 0 {
+            return Ok(Vec::new());
+        }
+        let nbytes = entry.token_len as usize * 2;
+        let buf = self.read_range(entry.token_offset, nbytes)?;
+        if buf.len() != nbytes {
+            return Err(PassageError::CorruptTokens(id));
+        }
+        let mut out = Vec::with_capacity(entry.token_len as usize);
+        for chunk in buf.chunks_exact(2) {
+            out.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+        Ok(out)
+    }
+
+    /// Batch fetch token spans sorted by ascending `token_offset` (LBA order).
+    pub fn fetch_tokens_many(&self, ids: &[u64]) -> Result<Vec<(u64, Vec<u16>)>, PassageError> {
+        let mut reqs: Vec<(usize, u64, PassageIndexEntry)> = Vec::with_capacity(ids.len());
+        for (orig_idx, &id) in ids.iter().enumerate() {
+            reqs.push((orig_idx, id, self.entry(id)?));
+        }
+        reqs.sort_unstable_by_key(|r| r.2.token_offset);
+
+        let mut results: Vec<(usize, u64, Vec<u16>)> = Vec::with_capacity(reqs.len());
+        for (orig_idx, id, entry) in reqs {
+            let tokens = if entry.token_len == 0 {
+                Vec::new()
+            } else {
+                let nbytes = entry.token_len as usize * 2;
+                let buf = self.read_range(entry.token_offset, nbytes)?;
+                let mut out = Vec::with_capacity(entry.token_len as usize);
+                for chunk in buf.chunks_exact(2) {
+                    out.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+                }
+                out
+            };
+            results.push((orig_idx, id, tokens));
+        }
+        results.sort_unstable_by_key(|r| r.0);
+        Ok(results.into_iter().map(|(_, id, t)| (id, t)).collect())
+    }
+
     pub fn fetch_record(&self, id: u64) -> Result<PassageRecord, PassageError> {
         let entry = self.entry(id)?;
         let record_offset = entry
@@ -231,6 +360,7 @@ impl PassageStore {
         let source = u32::from_le_bytes(header[12..16].try_into().unwrap());
         let text_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
         let meta_len = u32::from_le_bytes(header[20..24].try_into().unwrap()) as usize;
+        let token_len = u16::from_le_bytes(header[24..26].try_into().unwrap()) as usize;
 
         let payload = self.read_range(entry.file_offset, text_len + meta_len)?;
         let text = String::from_utf8(payload[..text_len].to_vec())?;
@@ -239,6 +369,11 @@ impl PassageStore {
         } else {
             serde_json::from_slice(&payload[text_len..text_len + meta_len])?
         };
+        let tokens = if token_len == 0 {
+            Vec::new()
+        } else {
+            self.fetch_tokens(id)?
+        };
 
         Ok(PassageRecord {
             id: rec_id,
@@ -246,6 +381,7 @@ impl PassageStore {
             timestamp,
             source,
             meta,
+            tokens,
         })
     }
 
@@ -255,7 +391,6 @@ impl PassageStore {
         for (orig_idx, &id) in ids.iter().enumerate() {
             reqs.push((orig_idx, id, self.entry(id)?));
         }
-        // Sort by ascending file offset for sequential NVMe / page-cache prefetching.
         reqs.sort_unstable_by_key(|r| r.2.file_offset);
 
         let mut results: Vec<(usize, u64, String)> = Vec::with_capacity(reqs.len());
@@ -265,5 +400,19 @@ impl PassageStore {
         }
         results.sort_unstable_by_key(|r| r.0);
         Ok(results.into_iter().map(|(_, id, text)| (id, text)).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_align_16kib() {
+        assert_eq!(align_page(0), 0);
+        assert_eq!(align_page(1), PAGE_ALIGN);
+        assert_eq!(align_page(PAGE_ALIGN), PAGE_ALIGN);
+        assert_eq!(align_page(PAGE_ALIGN + 1), PAGE_ALIGN * 2);
+        assert_eq!(align(100, 64), 128);
     }
 }

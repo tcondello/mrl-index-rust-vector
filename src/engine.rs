@@ -190,22 +190,21 @@ impl IndexEngine {
         };
         let embeds = self.embedder.embed(&[text.clone()]);
         let embedding = embeds.into_iter().next().unwrap();
+        let tokens = crate::embed::tokenize_u16(&text);
 
-        let id = self.passages.append(PassageRecord {
-            id: 0,
-            text: text.clone(),
-            timestamp,
-            source: src,
-            meta: serde_json::json!({}),
-        })?;
+        let id = self.passages.append_with_tokens(
+            PassageRecord {
+                id: 0,
+                text: text.clone(),
+                timestamp,
+                source: src,
+                meta: serde_json::json!({}),
+                tokens: Vec::new(),
+            },
+            &tokens,
+        )?;
 
-        let pending = PendingVector {
-            passage_id: id,
-            embedding,
-            timestamp,
-            source: src,
-            text,
-        };
+        let pending = PendingVector::new(id, embedding, timestamp, src, text);
 
         let maybe_block = {
             let mut ring = self.ring.lock();
@@ -235,22 +234,21 @@ impl IndexEngine {
                 } else {
                     *src_raw
                 };
-                let id = self.passages.append(PassageRecord {
-                    id: 0,
-                    text: text.clone(),
-                    timestamp: *ts,
-                    source: src,
-                    meta: serde_json::Value::Null,
-                })?;
+                let tokens = crate::embed::tokenize_u16(text);
+                let id = self.passages.append_with_tokens(
+                    PassageRecord {
+                        id: 0,
+                        text: text.clone(),
+                        timestamp: *ts,
+                        source: src,
+                        meta: serde_json::Value::Null,
+                        tokens: Vec::new(),
+                    },
+                    &tokens,
+                )?;
                 ids.push(id);
 
-                let pending = PendingVector {
-                    passage_id: id,
-                    embedding,
-                    timestamp: *ts,
-                    source: src,
-                    text: text.clone(),
-                };
+                let pending = PendingVector::new(id, embedding, *ts, src, text.clone());
                 let maybe_block = {
                     let mut ring = self.ring.lock();
                     ring.push(pending)

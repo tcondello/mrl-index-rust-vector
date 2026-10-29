@@ -418,6 +418,8 @@ pub fn run_retrieval_bench_params(
 
 /// Encode PaxBlocks once, then evaluate many `(w_s4, cs_tolerance, shortlist)` cells.
 /// Encoded bits are invariant to positive fold scaling, so this is a pure query-side sweep.
+///
+/// When `out_dir` is set, each cell JSON is written immediately (crash-safe).
 pub fn run_retrieval_sweep(
     data_dir: &Path,
     n_queries: Option<usize>,
@@ -426,6 +428,7 @@ pub fn run_retrieval_sweep(
     w_s4_values: &[f32],
     cs_values: &[f32],
     label_prefix: &str,
+    out_dir: Option<&Path>,
 ) -> Result<Vec<RetrievalBenchReport>, CorpusError> {
     let data = RetrievalBenchData::load(data_dir)?;
     let dims = data.dims();
@@ -446,7 +449,12 @@ pub fn run_retrieval_sweep(
     );
     data.corpus_embeddings.advise_random();
 
+    if let Some(dir) = out_dir {
+        std::fs::create_dir_all(dir)?;
+    }
+
     let mut reports = Vec::new();
+    let mut cell_i = 0usize;
     for &sl in shortlists {
         for &w in w_s4_values {
             for &cs in cs_values {
@@ -462,7 +470,13 @@ pub fn run_retrieval_sweep(
                     &label, &data, &blocks, n_queries, params, encode_ms,
                 );
                 report.print_summary();
+                if let Some(dir) = out_dir {
+                    let path = dir.join(format!("cell_{cell_i:03}_{label}.json"));
+                    let _ = std::fs::write(&path, report.to_json_pretty());
+                    eprintln!("wrote {}", path.display());
+                }
                 reports.push(report);
+                cell_i += 1;
             }
         }
     }
@@ -597,6 +611,156 @@ impl RetrievalBenchReport {
         println!(
             "perf: encode={:.1} ms  scan={:.3} ms/q  ({:.2} Mvecs/s)",
             self.encode_ms, self.mean_scan_ms, self.mvecs_per_sec
+        );
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PrecisionRerankReport {
+    pub label: String,
+    pub corpus: String,
+    pub n_vectors: usize,
+    pub n_queries: usize,
+    pub shortlist: usize,
+    pub precision: String,
+    pub bytes_per_vec: usize,
+    pub reranked_recall_at_10: f64,
+    pub qrels_ndcg_at_10: f64,
+    /// Fraction of fp32 R@10 retained (1.0 = perfect parity).
+    pub recall_parity_vs_fp32: f64,
+    pub mean_rerank_us: f64,
+    pub mean_scan_ms: f64,
+    pub encode_ms: f64,
+}
+
+/// Scan once per query; rerank the same shortlist at fp32 / fp16 / int8 and compare.
+pub fn run_precision_rerank_bench(
+    label_prefix: &str,
+    data_dir: &Path,
+    n_queries: Option<usize>,
+    shortlist: usize,
+    strata: StrataDepth,
+) -> Result<Vec<PrecisionRerankReport>, CorpusError> {
+    use crate::lowprec::{rerank_dot, RerankPrecision};
+
+    let data = RetrievalBenchData::load(data_dir)?;
+    let dims = data.dims();
+    if dims != 768 {
+        return Err(CorpusError::CorruptSize {
+            expected: 768,
+            got: dims,
+        });
+    }
+    let n = data.n_corpus();
+    let q_total = data.n_queries();
+    let n_queries = n_queries.unwrap_or(q_total).min(q_total);
+
+    data.corpus_embeddings.advise_sequential();
+    let t_enc = Instant::now();
+    eprintln!("encode PaxBlocks n={n} dims={dims} …");
+    let blocks = encode_corpus_mmap(&data.corpus_embeddings);
+    let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+    data.corpus_embeddings.advise_random();
+
+    let mut cfg = EngineConfig::default();
+    cfg.embed_dims = dims;
+    cfg.shortlist_cand = shortlist;
+    cfg.strata_depth = strata;
+    cfg.temporal_filter_enable = false;
+
+    let precisions = [
+        RerankPrecision::Fp32,
+        RerankPrecision::Fp16,
+        RerankPrecision::Int8,
+    ];
+    let mut r10 = [0.0f64; 3];
+    let mut ndcg = [0.0f64; 3];
+    let mut qrels_n = 0usize;
+    let mut rerank_us = [0.0f64; 3];
+    let mut scan_ms_sum = 0.0;
+
+    let progress_every = (n_queries / 20).max(1);
+    for qi in 0..n_queries {
+        let q = data.query_vector(qi);
+        let truth10: HashSet<usize> = data.neighbors[qi].iter().take(10).copied().collect();
+        let plan = QueryPlan::from_query(q, dims);
+
+        let t = Instant::now();
+        let hits = scan_blocks(&blocks, &plan, &cfg, None, None);
+        scan_ms_sum += t.elapsed().as_secs_f64() * 1000.0;
+        let ids = hit_ids(&hits);
+
+        for (pi, &prec) in precisions.iter().enumerate() {
+            let t_r = Instant::now();
+            let mut reranked: Vec<(usize, f32)> = ids
+                .iter()
+                .copied()
+                .map(|i| (i, rerank_dot(prec, q, data.corpus_vector(i))))
+                .collect();
+            reranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            rerank_us[pi] += t_r.elapsed().as_secs_f64() * 1e6;
+            let rerank_ids: Vec<usize> = reranked.into_iter().map(|(i, _)| i).collect();
+            r10[pi] += recall_at_k(&truth10, &rerank_ids, 10);
+            if let Some(rels) = data.qrels.get(&qi) {
+                if pi == 0 {
+                    qrels_n += 1;
+                }
+                ndcg[pi] += ndcg_at_k(rels, &rerank_ids, 10);
+            }
+        }
+
+        if (qi + 1) % progress_every == 0 || qi + 1 == n_queries {
+            eprintln!(
+                "  precision-bench queries {}/{}",
+                qi + 1,
+                n_queries
+            );
+        }
+    }
+
+    let qrels_denom = qrels_n.max(1) as f64;
+    let fp32_r10 = r10[0] / n_queries as f64;
+    let mean_scan_ms = scan_ms_sum / n_queries as f64;
+    let mut out = Vec::new();
+    for (pi, &prec) in precisions.iter().enumerate() {
+        let rr = r10[pi] / n_queries as f64;
+        out.push(PrecisionRerankReport {
+            label: format!("{label_prefix}-{}", prec.as_str()),
+            corpus: format!("{} / {}", data.manifest.dataset, data.dir.display()),
+            n_vectors: n,
+            n_queries,
+            shortlist,
+            precision: prec.as_str().into(),
+            bytes_per_vec: prec.bytes_per_vec(),
+            reranked_recall_at_10: rr,
+            qrels_ndcg_at_10: ndcg[pi] / qrels_denom,
+            recall_parity_vs_fp32: if fp32_r10 > 0.0 {
+                rr / fp32_r10
+            } else {
+                1.0
+            },
+            mean_rerank_us: rerank_us[pi] / n_queries as f64,
+            mean_scan_ms,
+            encode_ms,
+        });
+    }
+    Ok(out)
+}
+
+impl PrecisionRerankReport {
+    pub fn to_json_pretty(&self) -> String {
+        serde_json::to_string_pretty(self).expect("serialize")
+    }
+
+    pub fn print_summary(&self) {
+        println!(
+            "=== precision rerank [{}] {}  B/vec={}  R@10={:.4}  parity={:.4}  rerank={:.1} µs ===",
+            self.label,
+            self.precision,
+            self.bytes_per_vec,
+            self.reranked_recall_at_10,
+            self.recall_parity_vs_fp32,
+            self.mean_rerank_us
         );
     }
 }

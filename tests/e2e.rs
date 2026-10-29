@@ -99,14 +99,20 @@ fn binary_passage_store_roundtrip_and_batch_order() {
     let dir = tempdir().unwrap();
     let mut store = PassageStore::open(dir.path()).unwrap();
     for i in 0..10u64 {
+        let text = format!("passage-{i} with quotes \"and\"\nnewlines");
+        let tokens = mrl_index::embed::tokenize_u16(&text);
         store
-            .append(PassageRecord {
-                id: 0,
-                text: format!("passage-{i} with quotes \"and\"\nnewlines"),
-                timestamp: 100 + i as u32,
-                source: source::CODE,
-                meta: serde_json::json!({"ord": i}),
-            })
+            .append_with_tokens(
+                PassageRecord {
+                    id: 0,
+                    text,
+                    timestamp: 100 + i as u32,
+                    source: source::CODE,
+                    meta: serde_json::json!({"ord": i}),
+                    tokens: Vec::new(),
+                },
+                &tokens,
+            )
             .unwrap();
     }
     store.flush().unwrap();
@@ -116,10 +122,31 @@ fn binary_passage_store_roundtrip_and_batch_order() {
     assert_eq!(rec.timestamp, 103);
     assert_eq!(rec.text, "passage-3 with quotes \"and\"\nnewlines");
     assert_eq!(rec.meta["ord"], 3);
+    assert!(!rec.tokens.is_empty());
 
     // Reverse ID order ensures LBA-sorted fetch_many restores caller order.
     let batch = store.fetch_many(&[8, 2, 5, 0]).unwrap();
     let ids: Vec<u64> = batch.iter().map(|(id, _)| *id).collect();
     assert_eq!(ids, vec![8, 2, 5, 0]);
     assert!(batch[1].1.starts_with("passage-2 "));
+
+    // Token spans: shortlist path reads u16 IDs without UTF-8.
+    let tok_batch = store.fetch_tokens_many(&[8, 2, 5, 0]).unwrap();
+    assert_eq!(
+        tok_batch.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![8, 2, 5, 0]
+    );
+    assert_eq!(tok_batch[1].1, store.fetch_tokens(2).unwrap());
+
+    store.pad_to_page().unwrap();
+    let data_len = std::fs::metadata(dir.path().join("passages.bin"))
+        .unwrap()
+        .len();
+    assert_eq!(data_len % 16384, 0);
+}
+
+#[test]
+fn page_align_helper() {
+    assert_eq!(mrl_index::passage::align_page(1), 16384);
+    assert_eq!(mrl_index::passage::align(100, 64), 128);
 }

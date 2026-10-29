@@ -83,6 +83,21 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Hash whitespace/alnum tokens into stable `u16` IDs for `passages.bin` v2 storage.
+///
+/// Production swaps this for the real SentencePiece / BPE vocabulary IDs from the
+/// embedder; the demo hashing embedder uses the same tokenizer alphabet.
+pub fn tokenize_u16(text: &str) -> Vec<u16> {
+    tokenize(text)
+        .into_iter()
+        .map(|tok| {
+            let mut h = DefaultHasher::new();
+            tok.hash(&mut h);
+            (h.finish() & 0xffff) as u16
+        })
+        .collect()
+}
+
 fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
     let mut n2 = 0.0f32;
     for &x in &v {
@@ -134,4 +149,58 @@ pub fn dot_768(a: &[f32; 768], b: &[f32; 768]) -> f32 {
         i += 8;
     }
     acc0 + acc1 + acc2 + acc3 + acc4 + acc5 + acc6 + acc7
+}
+
+/// Dot `q` (fp32) against an `fp16` corpus vector with 8-way unrolled promote-mul-add.
+///
+/// Portable scalar path; ARMv8.2-FP16 / x86 F16C can replace the promote later.
+#[inline]
+pub fn dot_f16_768(q: &[f32; 768], v: &[half::f16; 768]) -> f32 {
+    let mut acc0 = 0.0f32;
+    let mut acc1 = 0.0f32;
+    let mut acc2 = 0.0f32;
+    let mut acc3 = 0.0f32;
+    let mut acc4 = 0.0f32;
+    let mut acc5 = 0.0f32;
+    let mut acc6 = 0.0f32;
+    let mut acc7 = 0.0f32;
+    let mut i = 0usize;
+    while i < 768 {
+        acc0 += q[i] * v[i].to_f32();
+        acc1 += q[i + 1] * v[i + 1].to_f32();
+        acc2 += q[i + 2] * v[i + 2].to_f32();
+        acc3 += q[i + 3] * v[i + 3].to_f32();
+        acc4 += q[i + 4] * v[i + 4].to_f32();
+        acc5 += q[i + 5] * v[i + 5].to_f32();
+        acc6 += q[i + 6] * v[i + 6].to_f32();
+        acc7 += q[i + 7] * v[i + 7].to_f32();
+        i += 8;
+    }
+    acc0 + acc1 + acc2 + acc3 + acc4 + acc5 + acc6 + acc7
+}
+
+/// Dot `q` (fp32) against symmetric int8 codes: `⟨q, scale · codes⟩`.
+#[inline]
+pub fn dot_i8_768(q: &[f32; 768], codes: &[i8; 768], scale: f32) -> f32 {
+    let mut acc0 = 0.0f32;
+    let mut acc1 = 0.0f32;
+    let mut acc2 = 0.0f32;
+    let mut acc3 = 0.0f32;
+    let mut acc4 = 0.0f32;
+    let mut acc5 = 0.0f32;
+    let mut acc6 = 0.0f32;
+    let mut acc7 = 0.0f32;
+    let mut i = 0usize;
+    while i < 768 {
+        acc0 += q[i] * codes[i] as f32;
+        acc1 += q[i + 1] * codes[i + 1] as f32;
+        acc2 += q[i + 2] * codes[i + 2] as f32;
+        acc3 += q[i + 3] * codes[i + 3] as f32;
+        acc4 += q[i + 4] * codes[i + 4] as f32;
+        acc5 += q[i + 5] * codes[i + 5] as f32;
+        acc6 += q[i + 6] * codes[i + 6] as f32;
+        acc7 += q[i + 7] * codes[i + 7] as f32;
+        i += 8;
+    }
+    (acc0 + acc1 + acc2 + acc3 + acc4 + acc5 + acc6 + acc7) * scale
 }
