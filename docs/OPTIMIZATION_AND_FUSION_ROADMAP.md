@@ -29,8 +29,8 @@ flowchart TD
     S1["Step 1: Algorithmic Calibration (Done)\nFWHT + RaBitQ scale + full 4-bit prefix"]
     S2["Step 2: SWAR/SIMD + Rayon + passages.bin (Done)\n~8× MS MARCO scan; Mac 13× microbench"]
     S25["Step 2.5: Shortlist calibration (Done)\nsl64→1024; 8.8M ANN 0.60→0.89"]
-    S3["Step 3: Fold 576-d tail into stratum4 (Next)\nReclaim unused 512 B; unrolled dot_768"]
-    S4["Step 4: fp16 / int8 pipeline"]
+    S3["Step 3: Fold 576-d tail into stratum4 (Done)\n8.8M ANN 0.89→0.95 @sl1024"]
+    S4["Step 4: fp16 / int8 pipeline (Next)"]
     S5["Step 5: passages.bin v2 tokens + 16 KiB pages"]
     S6["Step 6: Metal / MLX / ANE kernel fusion"]
 
@@ -85,21 +85,28 @@ flowchart TD
 
 ---
 
-### Step 3: Fixed 768-d Geometry & Bit-Budget Reclamation (`EMBED_DIMS = 768`) *(Next)*
-* **Objective**: Exploit the exact $768 = 12 \times 64 = 24 \times 32$ geometry to cover all 768 dimensions inside `PaxBlock64` and unroll all vector math at compile time.
+### Step 3: Fixed 768-d Geometry & Bit-Budget Reclamation (`EMBED_DIMS = 768`) *(Completed)*
+* **Objective**: Exploit the exact $768 = 12 \times 64 = 24 \times 32$ geometry to cover all 768 dimensions inside `PaxBlock64` and unroll 768-d dots at compile time.
 * **Success metric (MS MARCO full)**: Match or beat shortlist-1024 ANN R@10 (**≥ 0.887**) at shortlist **≤ 256**, and/or raise ANN R@10 at shortlist 1024 toward **≥ 0.95**.
 * **Changes**:
-  1. **Fold the 576-d Tail (`192..768`) into `stratum4_mid` (`512 B`)**:
-     * Currently, `stratum4_mid` (`64 × u64`) is written on encode and ignored on scan, while dims `192..768` ($9 \times 64$ dims) are discarded.
-     * Fold the $9 \times 64$ tail blocks into 64 dims via block Rademacher signs + 64-point FWHT:
-       $$u_d = \frac{1}{3} \sum_{b=0}^{8} s_{b,d}\, x_{192 + 64b + d} \quad (d \in 0..64)$$
-       and store `sign(FWHT(u))` in `stratum4_mid`. Every single bit of the 4 KiB `PaxBlock64` now contributes to ranking across all 768 dimensions.
+  1. **Fold the 576-d Tail (`192..768`) into `stratum4_mid` (`512 B`)** (`src/rotate.rs`, `src/quantize.rs`):
+     * Fold the $9 \times 64$ tail blocks into 64 dims via block Rademacher signs + 64-point FWHT (`1/\sqrt{n_{\text{blocks}}}` scale) and store `sign(FWHT(u))` in `stratum4_mid`.
+     * Scan ranks with the same RaBitQ-style IP-scaled 1-bit accumulator, weighted by recovered ‖x_tail‖ (`src/scan.rs`).
   2. **Pack Mid/Tail Norm Ratio into `VectorMeta::flags` (`u8`)**:
-     * Store $\rho = \text{round}\!\left(255 \cdot \lVert x[192..768] \rVert_2 / \lVert x[64..768] \rVert_2\right)$ in the unused 1-byte `flags` field of `VectorMeta`.
-     * Recover both $\lVert x_{\text{mid}} \rVert_2 = \sqrt{1 - \rho^2}\,\text{tail\_norm}$ (to weight Stratum 1 per-vector) and $\lVert x_{\text{tail}} \rVert_2 = \rho\,\text{tail\_norm}$ (for tighter post-S1 Cauchy–Schwarz pruning).
-  3. **Compile-Time `[f32; 768]` & 8-Way Unrolled SIMD Dot Product**:
-     * Replace `Vec<f32>` in `PendingVector` and `Embedder` with cache-line-aligned `[f32; 768]`.
-     * Unroll `dot_768` across 8 independent 4-lane SIMD accumulators (`24 × 32` floats, zero remainder loop) to saturate Apple Silicon FMA pipelines.
+     * Store $\rho = \text{round}\!\left(255 \cdot \lVert x[192..768] \rVert_2 / \lVert x[64..768] \rVert_2\right)$.
+     * Recover $\lVert x_{\text{mid}} \rVert_2$ (weights Stratum 1) and $\lVert x_{\text{tail}} \rVert_2$ (tighter post-S1 CS).
+  3. **8-Way Unrolled `dot_768`** (`src/embed.rs`):
+     * `dot()` dispatches to `dot_768` for length-768 slices (ring search + retrieval rerank). `PendingVector` stays `Vec<f32>` so 384-d demos keep working.
+* **Measured Impact (MS MARCO + EmbeddingGemma-2 @768)**:
+
+  | Config | ANN R@10 before → after | Notes |
+  |--------|-------------------------|-------|
+  | 1M / sl256 | 0.753 → **0.857** | |
+  | 1M / sl1024 | 0.873 → **0.939** | |
+  | 8.8M / sl256 | (~0.75 w/o fold) → **0.881** | Near 0.887 target |
+  | 8.8M / sl1024 | 0.887 → **0.952** | **PASS ≥ 0.95** |
+
+  Full qrels R@10 @ sl1024: 0.522 → **0.538** (oracle 0.547). See `bench_results/step3/RESULTS.md`.
 
 ---
 
