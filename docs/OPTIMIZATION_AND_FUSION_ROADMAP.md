@@ -181,3 +181,127 @@ On an M-series MacBook, the CPU (with its **AMX** matrix coprocessor), the **GPU
 * Because `mrl-index` already knows the scan score and Cauchy–Schwarz bounds from `scan_block`:
   * **Stage A (64-Token / Early-Layer Micro-Rerank)**: Run the first $L_{\text{early}}$ transformer layers on only the first **64 tokens** of all 128 shortlist candidates (static shape `128 × 64`, ideal for ANE/GPU tensor cores). Prune the bottom 96 candidates.
   * **Stage B (Full-Context Exact Rerank)**: Run the remaining layers and full token sequence **only on the top 32 survivors** (`4×` reduction in attention FLOPs during query reranking).
+
+---
+
+## 4. Deep Dive: Prefill, KV-Cache & Attention Optimizations in a Unified Engine
+
+A critical architectural insight when fusing `EmbeddingGemma-2` (or any modern transformer embedder) into `mrl-index` is how **embedding inference differs from generative LLM inference**:
+
+> **Embedding workloads are 100% Prefill (Zero Autoregressive Decode).**
+> Every operation—encoding a user query, ingesting a batch of passages into `PaxBlock64`, or JIT-reranking the shortlist—is a single forward **prefill pass** followed by pooling, projection, and normalization.
+
+Because everything is prefill, the bottleneck is **not** sequential KV-cache bandwidth per generated token; instead, it is **redundant prefill compute** (padding tokens, repeated task prefixes, redundant document context, and wasted late-layer compute on low-scoring shortlist candidates). Unifying the model with the index unlocks **six prefill & KV-cache optimizations** that an external embedding API can never do:
+
+```mermaid
+flowchart LR
+    subgraph Startup["Engine Init (Once)"]
+        PKV["Pinned Task Prefix KV-Cache\n• Query prefix: 'task: search result | query: '\n• Doc prefix: 'title: none | text: '"]
+    end
+
+    subgraph QueryPath["Unified Query & Rerank Pipeline"]
+        Q["1. Query Prefill (New Tokens Only)\nAttends to Pinned Query Prefix KV"]
+        QS["QuerySession (Pinned in Unified RAM)\n• q_final: [f16; 768]\n• q_early (Layer 8): [f16; 64]\n• Query Token KV States"]
+        SCAN["2. CPU SWAR/SIMD Scan\nUses q_final (or starts early on q_early)"]
+        FETCH["3. Zero-Copy u16 Token Fetch\n(passages.bin -> cu_seqlens)"]
+        PACK["4. Ragged Varlen Prefill (Layers 1..8)\nZero <pad> tokens + Doc Prefix KV"]
+        PRUNE["5. Mid-Prefill Early Exit\nDot with q_early -> Prune 75% of Shortlist"]
+        LATE["6. Late Prefill (Layers 9..L) + Fused Dot\nTop 25% Survivors -> Exact Cosine Score"]
+    end
+
+    PKV --> Q
+    Q --> QS
+    QS --> SCAN --> FETCH --> PACK
+    PKV --> PACK
+    PACK --> PRUNE --> LATE
+    QS --> PRUNE
+    QS --> LATE
+```
+
+### 4.1. `QuerySession` State Reuse (Eliminating Double Query Encoding & Retaining Query Activations)
+* **Current Redundancy in `src/engine.rs` & `src/rerank.rs`**:
+  Today, `IndexEngine::query_filtered` calls `self.embedder.embed(&[query_text])` to build `QueryPlan`, and then `rerank_batch` (`src/rerank.rs:33`) pushes `query_text` into the candidate batch and **runs prefill on the query a second time**.
+* **Unified Fix (`QuerySession`)**:
+  Encoding the query at the start of `query_filtered` produces a persistent `QuerySession` in Unified Memory containing:
+  1. `q_full: [f16; 768]` (for `QueryPlan`, `RingBuffer::search_exact`, and the final rerank dot product),
+  2. `q_early: [f16; 64]` (the intermediate Layer-8 MRL prefix for mid-prefill candidate pruning), and
+  3. Optional per-token query KV/hidden states $H_q \in \mathbb{R}^{L_q \times d}$ (enabling late-interaction MaxSim or lightweight cross-attention over the final top-32 survivors without re-running the query).
+
+### 4.2. Pinned Task / Instruction Prefix KV-Cache (`PrefixKVCache`)
+* **Why KV-Caching Matters for Embedders**:
+  `EmbeddingGemma-2` and modern asymmetric MRL models prepend static task prompts to every input:
+  * Query prompt: `"task: search result | query: "` (or domain-specific system instructions, $10\text{–}48$ tokens).
+  * Document prompt: `"title: none | text: "` (or structured metadata headers).
+* **Optimization**:
+  For causal-backbone embedders (or prefix-causal attention layers), the $K$ and $V$ states of the static instruction prefix are invariant across all queries and documents. Even in full bidirectional layers, the Layer-0 token embedding lookup and $Q, K, V$ linear projections of the static prefix are constant.
+  * Precompute and pin `query_prefix_kv` and `doc_prefix_kv` in GPU/Unified Memory at `IndexEngine::open()`.
+  * A 6-token user query with an 18-token task instruction only runs prefill on the **6 new tokens** ($4\times$ reduction in query prefill latency).
+
+### 4.3. Ragged / Packed `varlen` FlashAttention Prefill (`cu_seqlens`, Zero `<pad>` Waste)
+* **The Padding Tax**:
+  In a 64- or 128-candidate shortlist (`rerank_batch`) or ingest chunk (`ingest_batch`), passage lengths vary wildly (e.g., $25$ to $380$ tokens, mean $\sim 70$ tokens on MS MARCO). Standard batched tensor execution pads all sequences to `[B, max_seq_len]`, wasting **50%–75% of all linear projection ($W_{qkv}, W_o, \text{MLP}$) and attention FLOPs** on `<pad>` tokens.
+* **Unified Fix with Pre-Tokenized `passages.bin`**:
+  1. `PassageStore` stores pre-tokenized `u16` token arrays alongside raw text, and `PassageIndexEntry` tracks `token_offset` and `token_len` in RAM.
+  2. During `rerank_batch` or `ingest_batch`, pack all $K$ variable-length token slices contiguously into a **single 1D ragged buffer** `tokens: &[u16]` of length $N_{\text{total}} = \sum_{i=1}^K L_i$, accompanied by cumulative offsets `cu_seqlens: [u32; K + 1]`.
+  3. All MLP and QKV projections execute on the dense 2D matrix `[N_total, d_model]` (**zero padding tokens**), while the Metal FlashAttention kernel uses `cu_seqlens` to apply block-diagonal attention and reset RoPE positions (`pos = idx - cu_seqlens[i]`) per passage.
+  4. **Expected Speedup**: **$3\times\text{–}4.5\times$ faster prefill** on real-world variable-length corpora.
+
+### 4.4. Shared Document KV-Cache & "Late Chunking" on Data Ingest (`ingest_batch`)
+* When indexing multi-passage documents (code files, Markdown docs, SEC filings, PDFs), adjacent passages share the same parent document.
+* Unifying the ingestion pipeline with the model enables two context-preserving prefill optimizations:
+  1. **Shared Document-Header KV-Cache**: Prefill the document's shared preamble (file path, title, section hierarchy, summary) **once** into a transient KV state, then batch-prefill all child passages attending to that cached preamble KV.
+  2. **Late Chunking (Single Long-Context Prefill $\to$ Span Mean-Pooling $\to$ `PaxBlock64`)**: Run a single long-context FlashAttention prefill (e.g., $4,096\text{–}8,192$ tokens) over the entire document, then apply **span mean-pooling** over token ranges $[s_i, e_i)$ directly in the fused GPU epilogue kernel to emit 64 context-aware passage embeddings straight into a `PaxBlock64`.
+
+### 4.5. Speculative Mid-Prefill Early Exit (Layer + Token-Prefix Cascade)
+* During `rerank_batch` ($K = 128$ candidates):
+  1. **Chunked Token-Prefix Prefill**: Run Layers $1..L_{\text{early}}$ (e.g., Layer 8 of 24) on a packed buffer containing only the **first 64 tokens** of each candidate.
+  2. **In-Kernel Cauchy–Schwarz / MRL Pruning**: Project each candidate's Layer-8 pooled state to the 64-d MRL prefix, dot with `QuerySession.q_early`, and combine with the candidate's `scan_score` prior.
+  3. **Stream Compaction of `cu_seqlens`**: Drop the bottom 75% of candidates (e.g., $128 \to 32$ survivors) before executing Layers $9..24$ and before prefilling tokens $64..L_i$.
+
+### 4.6. Asynchronous CPU–GPU Pipeline Overlap (Speculative Scan + Streaming Prefill)
+* Currently, `query_filtered` is strictly serial:
+  `[GPU: Query Prefill] -> [CPU: Block Scan] -> [CPU: Passage Fetch] -> [GPU: Candidate Prefill]`
+* Because Apple Silicon CPU and GPU share Unified Memory and execute on independent hardware queues:
+  1. **Early-Layer Query Speculative Scan**: As soon as the GPU finishes Layer 8 of the **query** prefill, it writes `q_early: [f16; 64]` to Unified Memory and signals an atomic flag. The CPU immediately begins **Stratum-0 MRL prefix scanning** while the GPU finishes Layers $9..24$ of the query!
+  2. **Streaming Shortlist Prefill Warmup**: As soon as the CPU scan completes its warmup blocks (or identifies outlier candidates exceeding $\tau + \Delta$), a background thread pre-fetches their `u16` token spans and starts their GPU prefill **while the CPU finishes scanning the remaining blocks**.
+
+### 4.7. Proposed Unified Rust Trait (`src/rerank.rs` Evolution)
+
+```rust
+/// Persistent state from encoding a query once per search request.
+pub struct QuerySession {
+    /// Full L2-normalized 768-d query vector (for QueryPlan + exact cosine dot).
+    pub query_f32: [f32; 768],
+    /// Early-layer 64-d MRL prefix for mid-prefill shortlist pruning.
+    pub query_early_64: [f32; 64],
+}
+
+/// Ragged batch of pre-tokenized variable-length passages (zero padding).
+pub struct PackedTokenBatch<'a> {
+    /// Concatenated token IDs across all passages: length = cu_seqlens[B].
+    pub tokens: &'a [u16],
+    /// Cumulative sequence lengths: [0, len_0, len_0 + len_1, ...], length = B + 1.
+    pub cu_seqlens: &'a [u32],
+}
+
+pub trait UnifiedEmbedder: Send + Sync {
+    /// Tokenize raw text into u16 token IDs (used once at ingest time).
+    fn tokenize(&self, text: &str, out_tokens: &mut Vec<u16>);
+
+    /// Run query prefill (using pinned query task-prefix KV cache).
+    fn begin_query(&self, query_text: &str) -> QuerySession;
+
+    /// Ragged prefill for ingestion -> outputs vectors (or directly encodes PaxBlock64).
+    fn embed_packed(&self, batch: PackedTokenBatch<'_>) -> Vec<[f32; 768]>;
+
+    /// Fused shortlist rerank: ragged prefill + early-layer pruning + in-register query dot.
+    /// Returns only scalar exact scores (no 768-d float arrays copied back to CPU).
+    fn score_shortlist_packed(
+        &self,
+        session: &QuerySession,
+        batch: PackedTokenBatch<'_>,
+        prior_scores: &[f32],
+        top_k: usize,
+    ) -> Vec<(usize, f32)>;
+}
+```

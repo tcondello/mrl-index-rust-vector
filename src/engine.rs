@@ -10,7 +10,7 @@ use crate::block::{source, VectorId, VECTORS_PER_BLOCK};
 use crate::config::EngineConfig;
 use crate::embed::HashingEmbedder;
 use crate::passage::{PassageRecord, PassageStore};
-use crate::rerank::{rerank_batch, Embedder, RerankHit};
+use crate::rerank::{rerank_with_query_vec, Embedder, RerankHit};
 use crate::ring::{PendingVector, RingBuffer};
 use crate::scan::{scan_block, scan_blocks, QueryPlan, Shortlist};
 use crate::segment::{SegmentReader, SegmentWriter};
@@ -416,9 +416,9 @@ impl IndexEngine {
         let fetch_ms = t_fetch.elapsed().as_secs_f64() * 1000.0;
 
         let t_rr = Instant::now();
-        let hits = rerank_batch(
+        let hits = rerank_with_query_vec(
             self.embedder.as_ref(),
-            query_text,
+            query,
             &candidates,
             self.config.final_top_k,
         );

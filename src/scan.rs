@@ -388,21 +388,23 @@ pub fn scan_block(
 
     // --- Stratum 1: RaBitQ 1-bit mid-band (dims 64..191), IP-scaled ---
     // Using identity: Σ (2*bit_d - 1)*pos_d = rabitq_base + Σ bit_d * (2*pos_d)
-    // Step 3: scale by per-vector ‖x_mid‖ recovered from flags/ρ.
-    let mut s_bits = survivors;
-    while s_bits != 0 {
-        let v = s_bits.trailing_zeros() as usize;
-        scores[v] += plan.rabitq_base * mid_n[v];
-        s_bits &= s_bits - 1;
-    }
-
+    // Accumulate unscaled bitplane sum into `s1_dot`, then multiply once per survivor by `mid_n[v]`.
+    let mut s1_dot = [plan.rabitq_base; VECTORS_PER_BLOCK];
     for d in 0..RABITQ_DIMS {
         let mut bits = block.stratum1_rabitq.dim_bits[d] & survivors;
         let w = plan.rabitq_weights2[d];
         while bits != 0 {
             let v = bits.trailing_zeros() as usize;
-            scores[v] += w * mid_n[v];
+            s1_dot[v] += w;
             bits &= bits - 1;
+        }
+    }
+    {
+        let mut s_bits = survivors;
+        while s_bits != 0 {
+            let v = s_bits.trailing_zeros() as usize;
+            scores[v] += s1_dot[v] * mid_n[v];
+            s_bits &= s_bits - 1;
         }
     }
 
@@ -425,20 +427,21 @@ pub fn scan_block(
     // --- Stratum 4: folded high-dim tail (dims 192..768) → 64-bit FWHT signs ---
     // Applied for both L1 and Full64b whenever the query has a tail (Step 3).
     if plan.has_tail_fold {
-        let mut s_bits = survivors;
-        while s_bits != 0 {
-            let v = s_bits.trailing_zeros() as usize;
-            scores[v] += plan.tail_fold_base * high_n[v].max(1e-6);
-            s_bits &= s_bits - 1;
-        }
+        let mut s4_dot = [plan.tail_fold_base; VECTORS_PER_BLOCK];
         for d in 0..TAIL_FOLD_DIMS {
             let mut bits = block.stratum4_mid.dim_bits[d] & survivors;
             let w = plan.tail_fold_weights2[d];
             while bits != 0 {
                 let v = bits.trailing_zeros() as usize;
-                scores[v] += w * high_n[v].max(1e-6);
+                s4_dot[v] += w;
                 bits &= bits - 1;
             }
+        }
+        let mut s_bits = survivors;
+        while s_bits != 0 {
+            let v = s_bits.trailing_zeros() as usize;
+            scores[v] += s4_dot[v] * high_n[v].max(1e-6);
+            s_bits &= s_bits - 1;
         }
     }
 
@@ -482,8 +485,10 @@ pub fn scan_blocks(
     const PAR_THRESHOLD: usize = 64;
     if cfg.numa_sharding && blocks.len() >= PAR_THRESHOLD {
         // Warm up initial threshold τ on the first few blocks so every parallel worker
-        // starts with an effective Cauchy–Schwarz pruning bound.
-        let warmup = (cfg.shortlist_cand / VECTORS_PER_BLOCK + 1).min(4).min(blocks.len());
+        // starts with an effective Cauchy–Schwarz pruning bound even at shortlist 256..1024.
+        let warmup = (cfg.shortlist_cand / VECTORS_PER_BLOCK + 1)
+            .min(32)
+            .min(blocks.len());
         for i in 0..warmup {
             scan_block(
                 &blocks[i],

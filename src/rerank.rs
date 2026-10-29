@@ -53,3 +53,34 @@ pub fn rerank_batch(
     hits.truncate(top_k.max(1));
     hits
 }
+
+/// Re-embed candidate texts in one batch against an already-computed `query_vec`
+/// (avoids re-embedding the query a second time during `IndexEngine::query_filtered`).
+pub fn rerank_with_query_vec(
+    embedder: &dyn Embedder,
+    query_vec: &[f32],
+    candidates: &[(u64, String, f32)],
+    top_k: usize,
+) -> Vec<RerankHit> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let texts: Vec<String> = candidates.iter().map(|(_, t, _)| t.clone()).collect();
+    let embeds = embedder.embed(&texts);
+
+    let mut hits: Vec<RerankHit> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, (id, text, scan))| RerankHit {
+            passage_id: *id,
+            text: text.clone(),
+            scan_score: *scan,
+            exact_score: dot(query_vec, &embeds[i]),
+        })
+        .collect();
+
+    hits.sort_by(|a, b| b.exact_score.partial_cmp(&a.exact_score).unwrap());
+    hits.truncate(top_k.max(1));
+    hits
+}
