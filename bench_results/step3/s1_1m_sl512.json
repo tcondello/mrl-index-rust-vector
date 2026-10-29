@@ -1,0 +1,21 @@
+{
+  "label": "s1-1m-sl512",
+  "corpus": "BeIR/msmarco / data/msmarco_gemma2/1m_bin",
+  "model": "google/embeddinggemma-2",
+  "scale": "1m",
+  "mrl": true,
+  "n_vectors": 1000000,
+  "n_queries": 6980,
+  "dims": 768,
+  "shortlist": 512,
+  "strata": "l1_rabitq",
+  "corpus_mmap": true,
+  "shortlist_coverage_at_10": 0.9045128939828008,
+  "reranked_recall_at_10": 0.9045128939828008,
+  "reranked_recall_at_100": 0.6175515759312298,
+  "qrels_recall_at_10": 0.8141714422158549,
+  "qrels_ndcg_at_10": 0.6338130797041055,
+  "mean_scan_ms": 33.76576723438404,
+  "mvecs_per_sec": 29.61579380259689,
+  "encode_ms": 935.802267
+}
