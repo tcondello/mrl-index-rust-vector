@@ -28,6 +28,7 @@ use mrl_index::passage::{PassageRecord, PassageStore};
 use mrl_index::quantize::encode_block;
 use mrl_index::rerank::{PackedTokenBatch, UnifiedEmbedder};
 use mrl_index::scan::{scan_blocks, QueryPlan, Shortlist};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tempfile::tempdir;
 
@@ -83,6 +84,7 @@ struct LiveBenchReport {
     passages_per_sec: f64,
     query_embed_total_s: f64,
     query_embed_ms_per_query: f64,
+    single_query_embed_ms: f64,
     fused_paxblock_crc_verified_blocks: usize,
     fused_vs_unfused_bit_identical_blocks: usize,
     mean_doc_cosine_vs_pytorch_ref: f64,
@@ -231,21 +233,25 @@ fn main() {
         qrels.len()
     );
 
-    // Step 3: Tokenize all passages into u32 SentencePiece IDs and store in PassageStore v2
+    // Step 3: Tokenize all passages in parallel into u32 SentencePiece IDs and store in PassageStore v2
     println!("== [3/5] Tokenizing MS MARCO passages & persisting u32 token spans in passages.bin ==");
     let tmp_dir = tempdir().expect("tempdir");
     let mut store = PassageStore::open(tmp_dir.path()).expect("open PassageStore");
     let t_tok = Instant::now();
-    let mut all_tokens_per_doc: Vec<Vec<u32>> = Vec::with_capacity(n_passages);
-    for p in &passages {
-        let title_clean = p.title.trim();
-        let title_str = if title_clean.is_empty() {
-            "none"
-        } else {
-            title_clean
-        };
-        let prompted = format!("title: {title_str} | text: {}", p.text);
-        let toks = embedder.tokenize_u32(&prompted);
+    let all_tokens_per_doc: Vec<Vec<u32>> = passages
+        .par_iter()
+        .map(|p| {
+            let title_clean = p.title.trim();
+            let title_str = if title_clean.is_empty() {
+                "none"
+            } else {
+                title_clean
+            };
+            let prompted = format!("title: {title_str} | text: {}", p.text);
+            embedder.tokenize_u32(&prompted)
+        })
+        .collect();
+    for (p, toks) in passages.iter().zip(all_tokens_per_doc.iter()) {
         store
             .append_with_tokens_u32(
                 PassageRecord {
@@ -256,10 +262,9 @@ fn main() {
                     meta: serde_json::Value::Null,
                     tokens: Vec::new(),
                 },
-                &toks,
+                toks,
             )
             .expect("append_with_tokens_u32");
-        all_tokens_per_doc.push(toks);
     }
     store.flush().expect("flush PassageStore");
     let corpus_tokenize_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
@@ -337,20 +342,27 @@ fn main() {
     let corpus_embed_and_index_s = t_embed.elapsed().as_secs_f64();
     let passages_per_sec = (n_passages as f64) / corpus_embed_and_index_s.max(1e-6);
 
-    // Embed all 128 MS MARCO dev queries from scratch
-    let t_q = Instant::now();
-    let mut query_vecs: Vec<[f32; 768]> = Vec::with_capacity(queries.len());
-    for q in &queries {
-        let session = embedder.begin_query(&q.text);
-        query_vecs.push(session.query_f32);
+    // Measure single-query cold/warm latency over 8 sample queries
+    let sample_n = queries.len().min(8);
+    let t_sq = Instant::now();
+    for q in &queries[..sample_n] {
+        let _ = embedder.begin_query(&q.text);
     }
+    let single_query_embed_ms = (t_sq.elapsed().as_secs_f64() * 1000.0) / (sample_n as f64);
+
+    // Embed all 128 MS MARCO dev queries from scratch via packed batch
+    let t_q = Instant::now();
+    let query_refs: Vec<&str> = queries.iter().map(|q| q.text.as_str()).collect();
+    let sessions = embedder.begin_queries_batch(&query_refs);
+    let query_vecs: Vec<[f32; 768]> = sessions.into_iter().map(|s| s.query_f32).collect();
     let query_embed_total_s = t_q.elapsed().as_secs_f64();
     let query_embed_ms_per_query = (query_embed_total_s * 1000.0) / (queries.len() as f64);
     println!(
-        "   Embedded {} MS MARCO queries in {:.2}s ({:.2} ms/query)",
+        "   Embedded {} MS MARCO queries in {:.2}s ({:.2} ms/query batched, {:.2} ms/query single)",
         queries.len(),
         query_embed_total_s,
-        query_embed_ms_per_query
+        query_embed_ms_per_query,
+        single_query_embed_ms
     );
 
     // Audit cosine similarity against PyTorch A100 reference embeddings if present
@@ -558,6 +570,7 @@ fn main() {
         passages_per_sec,
         query_embed_total_s,
         query_embed_ms_per_query,
+        single_query_embed_ms,
         fused_paxblock_crc_verified_blocks: crc_ok_blocks,
         fused_vs_unfused_bit_identical_blocks: bit_identical_blocks,
         mean_doc_cosine_vs_pytorch_ref: mean_doc_cos,

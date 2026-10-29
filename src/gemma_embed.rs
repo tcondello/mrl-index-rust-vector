@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use half::{bf16, f16};
+use rayon::prelude::*;
 
 use crate::block::{PaxBlock64, EMBED_DIMS_768, MRL_PREFIX_DIMS, VECTORS_PER_BLOCK};
 use crate::embed::dot_768;
@@ -61,13 +62,26 @@ extern "C" {
         c: *mut f32,
         ldc: i32,
     );
+    fn vvtanhf(y: *mut f32, x: *const f32, n: *const i32);
+    fn BLASSetThreading(threading: i32) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn ensure_blas_single_threaded() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| unsafe {
+        // BLAS_THREADING_SINGLE_THREADED = 1: prevents Accelerate's internal GCD pool
+        // from contending with Rayon's worker threads while keeping hardware AMX active.
+        BLASSetThreading(1);
+    });
 }
 
 /// Compute `C = A · B^T` where `A` is `[m, k]` row-major and `B` is `[n, k]` row-major,
 /// writing `[m, n]` row-major into `C`.
 ///
 /// On macOS, dispatches to Apple Silicon's AMX hardware coprocessor via `Accelerate`'s
-/// `cblas_sgemm`. On other platforms, uses an 8-way unrolled FMA loop.
+/// `cblas_sgemm`, parallelized across `rayon` row chunks when `m >= 128`.
 #[inline]
 pub fn gemm_nt_f32(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     debug_assert_eq!(a.len(), m * k);
@@ -78,24 +92,55 @@ pub fn gemm_nt_f32(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: u
     }
 
     #[cfg(target_os = "macos")]
-    unsafe {
-        // CblasRowMajor = 101, CblasNoTrans = 111, CblasTrans = 112
-        cblas_sgemm(
-            101,
-            111,
-            112,
-            m as i32,
-            n as i32,
-            k as i32,
-            1.0,
-            a.as_ptr(),
-            k as i32,
-            b.as_ptr(),
-            k as i32,
-            0.0,
-            c.as_mut_ptr(),
-            n as i32,
-        );
+    {
+        ensure_blas_single_threaded();
+        if m >= 128 && m * n * k >= 4_000_000 {
+            let num_threads = rayon::current_num_threads().max(1);
+            let chunk_m = ((m + num_threads - 1) / num_threads).max(32);
+            a.par_chunks(chunk_m * k)
+                .zip(c.par_chunks_mut(chunk_m * n))
+                .for_each(|(a_sub, c_sub)| {
+                    let sub_m = a_sub.len() / k;
+                    unsafe {
+                        cblas_sgemm(
+                            101,
+                            111,
+                            112,
+                            sub_m as i32,
+                            n as i32,
+                            k as i32,
+                            1.0,
+                            a_sub.as_ptr(),
+                            k as i32,
+                            b.as_ptr(),
+                            k as i32,
+                            0.0,
+                            c_sub.as_mut_ptr(),
+                            n as i32,
+                        );
+                    }
+                });
+        } else {
+            unsafe {
+                // CblasRowMajor = 101, CblasNoTrans = 111, CblasTrans = 112
+                cblas_sgemm(
+                    101,
+                    111,
+                    112,
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    1.0,
+                    a.as_ptr(),
+                    k as i32,
+                    b.as_ptr(),
+                    k as i32,
+                    0.0,
+                    c.as_mut_ptr(),
+                    n as i32,
+                );
+            }
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -112,6 +157,132 @@ pub fn gemm_nt_f32(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: u
                 c_row[j] = sum;
             }
         }
+    }
+}
+
+/// Strided GEMM: `C = alpha * A · op(B) + beta * C` with custom row strides `lda`, `ldb`, `ldc`.
+/// Used for zero-copy per-head attention `Q_h · K_h^T` and `scores · V_h` on AMX.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_strided_f32(
+    trans_b: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: &[f32],
+    lda: usize,
+    b: &[f32],
+    ldb: usize,
+    beta: f32,
+    c: &mut [f32],
+    ldc: usize,
+) {
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe {
+        ensure_blas_single_threaded();
+        let tb = if trans_b { 112 } else { 111 };
+        cblas_sgemm(
+            101,
+            111,
+            tb,
+            m as i32,
+            n as i32,
+            k as i32,
+            alpha,
+            a.as_ptr(),
+            lda as i32,
+            b.as_ptr(),
+            ldb as i32,
+            beta,
+            c.as_mut_ptr(),
+            ldc as i32,
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        for i in 0..m {
+            let a_row = &a[i * lda..i * lda + k];
+            let c_row = &mut c[i * ldc..i * ldc + n];
+            if beta == 0.0 {
+                c_row.fill(0.0);
+            } else if beta != 1.0 {
+                for v in c_row.iter_mut() {
+                    *v *= beta;
+                }
+            }
+            if trans_b {
+                for j in 0..n {
+                    let b_row = &b[j * ldb..j * ldb + k];
+                    let mut sum = 0.0f32;
+                    for p in 0..k {
+                        sum += a_row[p] * b_row[p];
+                    }
+                    c_row[j] += alpha * sum;
+                }
+            } else {
+                for p in 0..k {
+                    let a_val = alpha * a_row[p];
+                    let b_row = &b[p * ldb..p * ldb + n];
+                    for j in 0..n {
+                        c_row[j] += a_val * b_row[j];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Vectorized `vForce` `gelu_tanh(gate[i]) * up[i]` in-place across L1-sized chunks.
+#[inline]
+fn gelu_tanh_chunk(gate: &mut [f32], up: &[f32]) {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    const CHUNK: usize = 2048;
+    #[cfg(target_os = "macos")]
+    {
+        let mut arg = [0.0f32; CHUNK];
+        let mut th = [0.0f32; CHUNK];
+        let mut offset = 0usize;
+        while offset < gate.len() {
+            let len = (gate.len() - offset).min(CHUNK);
+            let g_sub = &mut gate[offset..offset + len];
+            let u_sub = &up[offset..offset + len];
+            for i in 0..len {
+                let x = g_sub[i];
+                arg[i] = SQRT_2_OVER_PI * (x + 0.044715 * x * x * x);
+            }
+            let n_i32 = len as i32;
+            unsafe {
+                vvtanhf(th.as_mut_ptr(), arg.as_ptr(), &n_i32);
+            }
+            for i in 0..len {
+                g_sub[i] = 0.5 * g_sub[i] * (1.0 + th[i]) * u_sub[i];
+            }
+            offset += len;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        for i in 0..gate.len() {
+            gate[i] = gelu_tanh(gate[i]) * up[i];
+        }
+    }
+}
+
+#[inline]
+fn gelu_tanh_mul_in_place(gate: &mut [f32], up: &[f32]) {
+    const PAR_THRESHOLD: usize = 16_384;
+    if gate.len() >= PAR_THRESHOLD {
+        gate.par_chunks_mut(8192)
+            .zip(up.par_chunks(8192))
+            .for_each(|(g, u)| gelu_tanh_chunk(g, u));
+    } else {
+        gelu_tanh_chunk(gate, up);
     }
 }
 
@@ -870,20 +1041,28 @@ impl Gemma2Embedder {
         out
     }
 
-    /// RMSNorm in `f32` accumulation across rows of width `dim`.
-    fn apply_rms_norm_dim(&self, x: &[f32], weight: Option<&[f32]>, dim: usize) -> Vec<f32> {
+    /// RMSNorm in `f32` accumulation across rows of width `dim`, writing into `out`.
+    #[inline]
+    fn apply_rms_norm_dim_into(
+        &self,
+        x: &[f32],
+        out: &mut [f32],
+        weight: Option<&[f32]>,
+        dim: usize,
+    ) {
+        let eps = self.cfg.rms_norm_eps;
+        let direct = self.direct_rms_norm;
+        let inv_dim = 1.0 / (dim as f32);
         let n_rows = x.len() / dim;
-        let mut out = vec![0.0f32; x.len()];
-        for t in 0..n_rows {
-            let row = &x[t * dim..(t + 1) * dim];
-            let out_row = &mut out[t * dim..(t + 1) * dim];
+
+        let norm_row = |row: &[f32], out_row: &mut [f32]| {
             let mut sq_sum = 0.0f32;
             for &v in row {
                 sq_sum += v * v;
             }
-            let inv_rms = 1.0 / ((sq_sum / dim as f32) + self.cfg.rms_norm_eps).sqrt();
+            let inv_rms = 1.0 / (sq_sum * inv_dim + eps).sqrt();
             if let Some(w) = weight {
-                if self.direct_rms_norm {
+                if direct {
                     for c in 0..dim {
                         out_row[c] = row[c] * inv_rms * w[c];
                     }
@@ -897,7 +1076,120 @@ impl Gemma2Embedder {
                     out_row[c] = row[c] * inv_rms;
                 }
             }
+        };
+
+        if n_rows >= 512 {
+            x.par_chunks_exact(dim)
+                .zip(out.par_chunks_exact_mut(dim))
+                .for_each(|(r, o)| norm_row(r, o));
+        } else {
+            for t in 0..n_rows {
+                norm_row(&x[t * dim..(t + 1) * dim], &mut out[t * dim..(t + 1) * dim]);
+            }
         }
+    }
+
+    /// In-place RMSNorm in `f32` accumulation across rows of width `dim`.
+    #[inline]
+    fn apply_rms_norm_dim_in_place(&self, x: &mut [f32], weight: Option<&[f32]>, dim: usize) {
+        let eps = self.cfg.rms_norm_eps;
+        let direct = self.direct_rms_norm;
+        let inv_dim = 1.0 / (dim as f32);
+        let n_rows = x.len() / dim;
+
+        let norm_row = |row: &mut [f32]| {
+            let mut sq_sum = 0.0f32;
+            for &v in row.iter() {
+                sq_sum += v * v;
+            }
+            let inv_rms = 1.0 / (sq_sum * inv_dim + eps).sqrt();
+            if let Some(w) = weight {
+                if direct {
+                    for c in 0..dim {
+                        row[c] = row[c] * inv_rms * w[c];
+                    }
+                } else {
+                    for c in 0..dim {
+                        row[c] = row[c] * inv_rms * (1.0 + w[c]);
+                    }
+                }
+            } else {
+                for c in 0..dim {
+                    row[c] *= inv_rms;
+                }
+            }
+        };
+
+        if n_rows >= 512 {
+            x.par_chunks_exact_mut(dim).for_each(norm_row);
+        } else {
+            for t in 0..n_rows {
+                norm_row(&mut x[t * dim..(t + 1) * dim]);
+            }
+        }
+    }
+
+    /// Fused RMSNorm(x, weight) + residual addition into `hidden`:
+    /// `hidden[t] = (hidden[t] + rms_norm(x[t], weight)) * scale_after`.
+    #[inline]
+    fn apply_rms_norm_add_into(
+        &self,
+        x: &[f32],
+        hidden: &mut [f32],
+        weight: &[f32],
+        scale_after: f32,
+    ) {
+        let dim = self.cfg.hidden_size;
+        let eps = self.cfg.rms_norm_eps;
+        let direct = self.direct_rms_norm;
+        let inv_dim = 1.0 / (dim as f32);
+        let n_rows = x.len() / dim;
+
+        let fuse_row = |row: &[f32], h_row: &mut [f32]| {
+            let mut sq_sum = 0.0f32;
+            for &v in row {
+                sq_sum += v * v;
+            }
+            let inv_rms = 1.0 / (sq_sum * inv_dim + eps).sqrt();
+            if direct {
+                if scale_after == 1.0 {
+                    for c in 0..dim {
+                        h_row[c] += row[c] * inv_rms * weight[c];
+                    }
+                } else {
+                    for c in 0..dim {
+                        h_row[c] = (h_row[c] + row[c] * inv_rms * weight[c]) * scale_after;
+                    }
+                }
+            } else if scale_after == 1.0 {
+                for c in 0..dim {
+                    h_row[c] += row[c] * inv_rms * (1.0 + weight[c]);
+                }
+            } else {
+                for c in 0..dim {
+                    h_row[c] = (h_row[c] + row[c] * inv_rms * (1.0 + weight[c])) * scale_after;
+                }
+            }
+        };
+
+        if n_rows >= 512 {
+            x.par_chunks_exact(dim)
+                .zip(hidden.par_chunks_exact_mut(dim))
+                .for_each(|(r, h)| fuse_row(r, h));
+        } else {
+            for t in 0..n_rows {
+                fuse_row(
+                    &x[t * dim..(t + 1) * dim],
+                    &mut hidden[t * dim..(t + 1) * dim],
+                );
+            }
+        }
+    }
+
+    /// RMSNorm in `f32` accumulation across rows of width `dim`.
+    fn apply_rms_norm_dim(&self, x: &[f32], weight: Option<&[f32]>, dim: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; x.len()];
+        self.apply_rms_norm_dim_into(x, &mut out, weight, dim);
         out
     }
 
@@ -1101,15 +1393,33 @@ impl Gemma2Embedder {
         batch: PackedTokenBatch<'_>,
         up_to_layer: usize,
     ) -> Vec<f32> {
+        self.forward_ragged_layers_with_early(batch, None, up_to_layer)
+            .1
+    }
+
+    fn forward_ragged_layers_with_early(
+        &self,
+        batch: PackedTokenBatch<'_>,
+        early_layer: Option<usize>,
+        up_to_layer: usize,
+    ) -> (Option<Vec<f32>>, Vec<f32>) {
         let total_tokens = batch.tokens.len();
         let d = self.cfg.hidden_size;
         if total_tokens == 0 {
-            return Vec::new();
+            return (early_layer.map(|_| Vec::new()), Vec::new());
         }
 
         let n_heads = self.cfg.num_attention_heads;
         let inter = self.cfg.intermediate_size;
         let num_layers = self.cfg.num_hidden_layers;
+        let num_seqs = batch.num_sequences();
+
+        let mut max_seq_len = 1usize;
+        for seq_idx in 0..num_seqs {
+            let s = batch.cu_seqlens[seq_idx] as usize;
+            let e = batch.cu_seqlens[seq_idx + 1] as usize;
+            max_seq_len = max_seq_len.max(e.saturating_sub(s));
+        }
 
         let mut hidden = self.lookup_tokens(batch.tokens);
 
@@ -1130,19 +1440,52 @@ impl Gemma2Embedder {
             for v in &mut ple_raw {
                 *v *= ple_scale;
             }
-            Some(self.apply_rms_norm_dim(&ple_raw, Some(ple_n), d))
+            self.apply_rms_norm_dim_in_place(&mut ple_raw, Some(ple_n), d);
+            Some(ple_raw)
         } else {
             None
         };
 
+        let max_layer = up_to_layer.min(self.layers.len());
+        let max_hd = self
+            .layers
+            .iter()
+            .map(|l| l.head_dim)
+            .max()
+            .unwrap_or(self.cfg.head_dim);
+        let max_kv_heads = self
+            .layers
+            .iter()
+            .map(|l| l.num_kv_heads)
+            .max()
+            .unwrap_or(self.cfg.num_key_value_heads);
+        let max_q_dim = n_heads * max_hd;
+        let max_kv_dim = max_kv_heads * max_hd;
+
+        // Pre-allocate all layer workspaces once outside the 24-layer loop (zero per-layer mallocs!)
+        let mut norm_buf = vec![0.0f32; total_tokens * d];
+        let mut q_buf = vec![0.0f32; total_tokens * max_q_dim];
+        let mut k_buf = vec![0.0f32; total_tokens * max_kv_dim];
+        let mut v_buf = vec![0.0f32; total_tokens * max_kv_dim];
+        let mut attn_out_buf = vec![0.0f32; total_tokens * max_q_dim];
         let mut proj_attn = vec![0.0f32; total_tokens * d];
         let mut gate = vec![0.0f32; total_tokens * inter];
         let mut up = vec![0.0f32; total_tokens * inter];
         let mut mlp_out = vec![0.0f32; total_tokens * d];
         let mut ple_gate = vec![0.0f32; total_tokens * d];
         let mut ple_proj = vec![0.0f32; total_tokens * d];
+        let mut cos_tab = vec![0.0f32; max_seq_len * (max_hd / 2)];
+        let mut sin_tab = vec![0.0f32; max_seq_len * (max_hd / 2)];
+        let mut cached_rope_key: Option<(usize, u32)> = None;
 
-        let max_layer = up_to_layer.min(self.layers.len());
+        let mut early_out: Option<Vec<f32>> = None;
+
+        let mut t_gemm = 0.0f64;
+        let mut t_norm = 0.0f64;
+        let mut t_rope = 0.0f64;
+        let mut t_attn = 0.0f64;
+        let mut t_act = 0.0f64;
+        let trace_timing = std::env::var("GEMMA2_PROFILE").is_ok() && total_tokens > 500;
         for (l_idx, layer) in self.layers[..max_layer].iter().enumerate() {
             let hd = layer.head_dim;
             let n_kv = layer.num_kv_heads;
@@ -1155,168 +1498,268 @@ impl Gemma2Embedder {
                 1.0 / (hd as f32).sqrt()
             };
 
-            let normed = self.apply_rms_norm(&hidden, &layer.input_layernorm);
+            let t0 = std::time::Instant::now();
+            self.apply_rms_norm_dim_into(&hidden, &mut norm_buf, Some(&layer.input_layernorm), d);
+            t_norm += t0.elapsed().as_secs_f64();
 
-            let mut q = vec![0.0f32; total_tokens * q_dim];
-            let mut k = vec![0.0f32; total_tokens * kv_dim];
-            let mut v = vec![0.0f32; total_tokens * kv_dim];
-            let mut attn_out = vec![0.0f32; total_tokens * q_dim];
+            let t0 = std::time::Instant::now();
+            let q = &mut q_buf[..total_tokens * q_dim];
+            let k = &mut k_buf[..total_tokens * kv_dim];
+            let v = &mut v_buf[..total_tokens * kv_dim];
+            let attn_out = &mut attn_out_buf[..total_tokens * q_dim];
 
             // Dense ragged GEMMs across all sequences at once (zero padding tokens!)
-            gemm_nt_f32(&normed, &layer.q_proj, &mut q, total_tokens, q_dim, d);
-            gemm_nt_f32(&normed, &layer.k_proj, &mut k, total_tokens, kv_dim, d);
-            gemm_nt_f32(&normed, &layer.v_proj, &mut v, total_tokens, kv_dim, d);
+            gemm_nt_f32(&norm_buf, &layer.q_proj, q, total_tokens, q_dim, d);
+            gemm_nt_f32(&norm_buf, &layer.k_proj, k, total_tokens, kv_dim, d);
+            gemm_nt_f32(&norm_buf, &layer.v_proj, v, total_tokens, kv_dim, d);
+            t_gemm += t0.elapsed().as_secs_f64();
 
+            let t0 = std::time::Instant::now();
             if let Some(ref qn) = layer.q_norm {
-                q = self.apply_rms_norm_dim(&q, Some(qn), hd);
+                self.apply_rms_norm_dim_in_place(q, Some(qn), hd);
             }
             if let Some(ref kn) = layer.k_norm {
-                k = self.apply_rms_norm_dim(&k, Some(kn), hd);
-                v = self.apply_rms_norm_dim(&v, None, hd);
+                self.apply_rms_norm_dim_in_place(k, Some(kn), hd);
+                self.apply_rms_norm_dim_in_place(v, None, hd);
+            }
+            t_norm += t0.elapsed().as_secs_f64();
+
+            let t0 = std::time::Instant::now();
+            // Recompute [max_seq_len, hd/2] (cos, sin) table only when (hd, rope_theta) changes
+            let half = hd / 2;
+            let rope_key = (hd, layer.rope_theta.to_bits());
+            if cached_rope_key != Some(rope_key) {
+                for i in 0..half {
+                    let freq = 1.0 / layer.rope_theta.powf((2 * i) as f32 / (hd as f32));
+                    for pos in 0..max_seq_len {
+                        let (s, c) = ((pos as f32) * freq).sin_cos();
+                        sin_tab[pos * half + i] = s;
+                        cos_tab[pos * half + i] = c;
+                    }
+                }
+                cached_rope_key = Some(rope_key);
             }
 
-            // Precompute inverse frequencies once per layer
-            let half = hd / 2;
-            let inv_freq: Vec<f32> = (0..half)
-                .map(|i| 1.0 / layer.rope_theta.powf((2 * i) as f32 / (hd as f32)))
-                .collect();
-
-            // Apply RoPE per sequence (sharing sin/cos across all Q and K heads at each position)
-            for seq_idx in 0..batch.num_sequences() {
+            // Apply RoPE per sequence using precomputed sin/cos table
+            for seq_idx in 0..num_seqs {
                 let start = batch.cu_seqlens[seq_idx] as usize;
                 let end = batch.cu_seqlens[seq_idx + 1] as usize;
                 let seq_len = end.saturating_sub(start);
                 for local_pos in 0..seq_len {
                     let t = start + local_pos;
-                    let pos_f = local_pos as f32;
+                    let cos_row = &cos_tab[local_pos * half..(local_pos + 1) * half];
+                    let sin_row = &sin_tab[local_pos * half..(local_pos + 1) * half];
                     let q_tok = &mut q[t * q_dim..(t + 1) * q_dim];
                     let k_tok = &mut k[t * kv_dim..(t + 1) * kv_dim];
-                    for i in 0..half {
-                        let (sin_a, cos_a) = (pos_f * inv_freq[i]).sin_cos();
-                        for h in 0..n_heads {
-                            let base = h * hd;
-                            let x0 = q_tok[base + i];
-                            let x1 = q_tok[base + half + i];
-                            q_tok[base + i] = x0 * cos_a - x1 * sin_a;
-                            q_tok[base + half + i] = x1 * cos_a + x0 * sin_a;
+                    for h in 0..n_heads {
+                        let base = h * hd;
+                        let (q_lo, q_hi) = q_tok[base..base + hd].split_at_mut(half);
+                        for i in 0..half {
+                            let x0 = q_lo[i];
+                            let x1 = q_hi[i];
+                            let c = cos_row[i];
+                            let s = sin_row[i];
+                            q_lo[i] = x0 * c - x1 * s;
+                            q_hi[i] = x1 * c + x0 * s;
                         }
-                        for h in 0..n_kv {
-                            let base = h * hd;
-                            let x0 = k_tok[base + i];
-                            let x1 = k_tok[base + half + i];
-                            k_tok[base + i] = x0 * cos_a - x1 * sin_a;
-                            k_tok[base + half + i] = x1 * cos_a + x0 * sin_a;
+                    }
+                    for h in 0..n_kv {
+                        let base = h * hd;
+                        let (k_lo, k_hi) = k_tok[base..base + hd].split_at_mut(half);
+                        for i in 0..half {
+                            let x0 = k_lo[i];
+                            let x1 = k_hi[i];
+                            let c = cos_row[i];
+                            let s = sin_row[i];
+                            k_lo[i] = x0 * c - x1 * s;
+                            k_hi[i] = x1 * c + x0 * s;
                         }
                     }
                 }
             }
+            t_rope += t0.elapsed().as_secs_f64();
 
-            // Block-diagonal FlashAttention per sequence span [start..end)
+            let t0 = std::time::Instant::now();
+            // Block-diagonal FlashAttention per sequence span [start..end) via strided AMX GEMM
             let softcap = self.cfg.attn_logit_softcapping;
             let sliding_win = layer.sliding_window;
-            for seq_idx in 0..batch.num_sequences() {
-                let start = batch.cu_seqlens[seq_idx] as usize;
-                let end = batch.cu_seqlens[seq_idx + 1] as usize;
+            let q_ref: &[f32] = q;
+            let k_ref: &[f32] = k;
+            let v_ref: &[f32] = v;
+
+            let exec_seq_attn = |start: usize, end: usize, attn_out_seq: &mut [f32]| {
                 let seq_len = end.saturating_sub(start);
                 if seq_len == 0 {
-                    continue;
+                    return;
                 }
+                let q_seq = &q_ref[start * q_dim..end * q_dim];
+                let k_seq = &k_ref[start * kv_dim..end * kv_dim];
+                let v_seq = &v_ref[start * kv_dim..end * kv_dim];
+                let mut scores = vec![0.0f32; seq_len * seq_len];
 
-                let mut scores = vec![0.0f32; seq_len];
-                for local_t in 0..seq_len {
-                    let t = start + local_t;
-                    let (s_lo, s_hi) = if let Some(win) = sliding_win {
-                        (local_t.saturating_sub(win), (local_t + win + 1).min(seq_len))
-                    } else {
-                        (0, seq_len)
-                    };
-                    for h in 0..n_heads {
-                        let kv_h = h / gqa_group;
-                        let q_slice = &q[t * q_dim + h * hd..t * q_dim + (h + 1) * hd];
+                for h in 0..n_heads {
+                    let kv_h = h / gqa_group;
+                    // S = attn_scale * Q_h * K_{kv_h}^T  ([seq_len, seq_len])
+                    gemm_strided_f32(
+                        true,
+                        seq_len,
+                        seq_len,
+                        hd,
+                        attn_scale,
+                        &q_seq[h * hd..],
+                        q_dim,
+                        &k_seq[kv_h * hd..],
+                        kv_dim,
+                        0.0,
+                        &mut scores,
+                        seq_len,
+                    );
 
+                    for local_t in 0..seq_len {
+                        let row = &mut scores[local_t * seq_len..(local_t + 1) * seq_len];
+                        let (s_lo, s_hi) = if let Some(win) = sliding_win {
+                            (local_t.saturating_sub(win), (local_t + win + 1).min(seq_len))
+                        } else {
+                            (0, seq_len)
+                        };
+                        if s_lo > 0 {
+                            row[..s_lo].fill(0.0);
+                        }
+                        if s_hi < seq_len {
+                            row[s_hi..].fill(0.0);
+                        }
+                        let active = &mut row[s_lo..s_hi];
                         let mut max_score = f32::NEG_INFINITY;
-                        for local_s in s_lo..s_hi {
-                            let s = start + local_s;
-                            let k_slice =
-                                &k[s * kv_dim + kv_h * hd..s * kv_dim + (kv_h + 1) * hd];
-                            let mut dot = 0.0f32;
-                            for c in 0..hd {
-                                dot += q_slice[c] * k_slice[c];
+                        if let Some(cap) = softcap {
+                            let inv_cap = 1.0 / cap;
+                            for sc in active.iter_mut() {
+                                *sc = (*sc * inv_cap).tanh() * cap;
+                                if *sc > max_score {
+                                    max_score = *sc;
+                                }
                             }
-                            let mut sc = dot * attn_scale;
-                            if let Some(cap) = softcap {
-                                sc = (sc / cap).tanh() * cap;
-                            }
-                            scores[local_s] = sc;
-                            if sc > max_score {
-                                max_score = sc;
+                        } else {
+                            for &sc in active.iter() {
+                                if sc > max_score {
+                                    max_score = sc;
+                                }
                             }
                         }
-
                         let mut exp_sum = 0.0f32;
-                        for local_s in s_lo..s_hi {
-                            let e = (scores[local_s] - max_score).exp();
-                            scores[local_s] = e;
+                        for sc in active.iter_mut() {
+                            let e = (*sc - max_score).exp();
+                            *sc = e;
                             exp_sum += e;
                         }
                         let inv_sum = 1.0 / exp_sum.max(1e-12);
-
-                        let out_slice =
-                            &mut attn_out[t * q_dim + h * hd..t * q_dim + (h + 1) * hd];
-                        for local_s in s_lo..s_hi {
-                            let s = start + local_s;
-                            let w = scores[local_s] * inv_sum;
-                            let v_slice =
-                                &v[s * kv_dim + kv_h * hd..s * kv_dim + (kv_h + 1) * hd];
-                            for c in 0..hd {
-                                out_slice[c] += w * v_slice[c];
-                            }
+                        for sc in active.iter_mut() {
+                            *sc *= inv_sum;
                         }
                     }
+
+                    // Out_h = S * V_{kv_h}  ([seq_len, hd], written at stride q_dim)
+                    gemm_strided_f32(
+                        false,
+                        seq_len,
+                        hd,
+                        seq_len,
+                        1.0,
+                        &scores,
+                        seq_len,
+                        &v_seq[kv_h * hd..],
+                        kv_dim,
+                        0.0,
+                        &mut attn_out_seq[h * hd..],
+                        q_dim,
+                    );
+                }
+            };
+
+            if num_seqs > 1 && total_tokens >= 256 {
+                let mut seq_slices: Vec<(usize, usize, &mut [f32])> = Vec::with_capacity(num_seqs);
+                let mut rest = &mut attn_out[..];
+                let mut prev_end = 0usize;
+                for seq_idx in 0..num_seqs {
+                    let start = batch.cu_seqlens[seq_idx] as usize;
+                    let end = batch.cu_seqlens[seq_idx + 1] as usize;
+                    let skip = (start - prev_end) * q_dim;
+                    if skip > 0 {
+                        let (_, r) = rest.split_at_mut(skip);
+                        rest = r;
+                    }
+                    let len_elems = (end - start) * q_dim;
+                    let (seq_slice, r) = rest.split_at_mut(len_elems);
+                    rest = r;
+                    prev_end = end;
+                    seq_slices.push((start, end, seq_slice));
+                }
+                seq_slices
+                    .into_par_iter()
+                    .for_each(|(start, end, slice)| exec_seq_attn(start, end, slice));
+            } else {
+                for seq_idx in 0..num_seqs {
+                    let start = batch.cu_seqlens[seq_idx] as usize;
+                    let end = batch.cu_seqlens[seq_idx + 1] as usize;
+                    exec_seq_attn(start, end, &mut attn_out[start * q_dim..end * q_dim]);
                 }
             }
+            t_attn += t0.elapsed().as_secs_f64();
 
+            let t0 = std::time::Instant::now();
             gemm_nt_f32(
-                &attn_out,
+                attn_out,
                 &layer.o_proj,
                 &mut proj_attn,
                 total_tokens,
                 d,
                 q_dim,
             );
+            t_gemm += t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
             if layer.pre_feedforward_layernorm.is_some() {
-                let post_attn = self.apply_rms_norm(&proj_attn, &layer.post_attention_layernorm);
-                for i in 0..hidden.len() {
-                    hidden[i] += post_attn[i];
-                }
+                self.apply_rms_norm_add_into(
+                    &proj_attn,
+                    &mut hidden,
+                    &layer.post_attention_layernorm,
+                    1.0,
+                );
             } else {
                 for i in 0..hidden.len() {
                     hidden[i] += proj_attn[i];
                 }
             }
 
-            let ffn_in = if let Some(ref pre_ffn) = layer.pre_feedforward_layernorm {
-                self.apply_rms_norm(&hidden, pre_ffn)
+            if let Some(ref pre_ffn) = layer.pre_feedforward_layernorm {
+                self.apply_rms_norm_dim_into(&hidden, &mut norm_buf, Some(pre_ffn), d);
             } else {
-                self.apply_rms_norm(&hidden, &layer.post_attention_layernorm)
+                self.apply_rms_norm_dim_into(
+                    &hidden,
+                    &mut norm_buf,
+                    Some(&layer.post_attention_layernorm),
+                    d,
+                );
             };
-            gemm_nt_f32(&ffn_in, &layer.gate_proj, &mut gate, total_tokens, inter, d);
-            gemm_nt_f32(&ffn_in, &layer.up_proj, &mut up, total_tokens, inter, d);
-            for i in 0..gate.len() {
-                gate[i] = gelu_tanh(gate[i]) * up[i];
-            }
+            t_norm += t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
+            gemm_nt_f32(&norm_buf, &layer.gate_proj, &mut gate, total_tokens, inter, d);
+            gemm_nt_f32(&norm_buf, &layer.up_proj, &mut up, total_tokens, inter, d);
+            t_gemm += t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
+            gelu_tanh_mul_in_place(&mut gate, &up);
+            t_act += t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
             gemm_nt_f32(&gate, &layer.down_proj, &mut mlp_out, total_tokens, d, inter);
+            t_gemm += t0.elapsed().as_secs_f64();
 
+            let t0 = std::time::Instant::now();
             if let Some(ref post_ffn) = layer.post_feedforward_layernorm {
-                let mlp_normed = self.apply_rms_norm(&mlp_out, post_ffn);
-                for i in 0..hidden.len() {
-                    hidden[i] += mlp_normed[i];
-                }
+                self.apply_rms_norm_add_into(&mlp_out, &mut hidden, post_ffn, 1.0);
             } else {
                 for i in 0..hidden.len() {
                     hidden[i] += mlp_out[i];
                 }
             }
+            t_norm += t0.elapsed().as_secs_f64();
 
             // Per-Layer Embedding (`EmbeddingGemma2TextPLEBlock`) residual sub-block
             if let (
@@ -1330,24 +1773,127 @@ impl Gemma2Embedder {
                 &layer.ple_projection,
                 &layer.ple_post_norm,
             ) {
+                let t0 = std::time::Instant::now();
                 gemm_nt_f32(&hidden, gate_w, &mut ple_gate, total_tokens, d, d);
-                for t in 0..total_tokens {
-                    let ple_slice =
-                        &ple_all[(t * num_layers + l_idx) * d..(t * num_layers + l_idx + 1) * d];
-                    let g_row = &mut ple_gate[t * d..(t + 1) * d];
-                    for c in 0..d {
-                        g_row[c] = gelu_tanh(g_row[c]) * ple_slice[c];
+                t_gemm += t0.elapsed().as_secs_f64();
+                let t0 = std::time::Instant::now();
+                if total_tokens >= 256 {
+                    ple_gate
+                        .par_chunks_exact_mut(d)
+                        .enumerate()
+                        .for_each(|(t, g_row)| {
+                            let ple_slice = &ple_all
+                                [(t * num_layers + l_idx) * d..(t * num_layers + l_idx + 1) * d];
+                            gelu_tanh_chunk(g_row, ple_slice);
+                        });
+                } else {
+                    for t in 0..total_tokens {
+                        let ple_slice = &ple_all
+                            [(t * num_layers + l_idx) * d..(t * num_layers + l_idx + 1) * d];
+                        let g_row = &mut ple_gate[t * d..(t + 1) * d];
+                        gelu_tanh_chunk(g_row, ple_slice);
                     }
                 }
+                t_act += t0.elapsed().as_secs_f64();
+                let t0 = std::time::Instant::now();
                 gemm_nt_f32(&ple_gate, proj_w, &mut ple_proj, total_tokens, d, d);
-                let ple_out = self.apply_rms_norm(&ple_proj, norm_w);
-                for i in 0..hidden.len() {
-                    hidden[i] = (hidden[i] + ple_out[i]) * layer.layer_scalar;
-                }
+                t_gemm += t0.elapsed().as_secs_f64();
+                let t0 = std::time::Instant::now();
+                self.apply_rms_norm_add_into(&ple_proj, &mut hidden, norm_w, layer.layer_scalar);
+                t_norm += t0.elapsed().as_secs_f64();
+            }
+
+            if early_layer == Some(l_idx + 1) {
+                early_out = Some(self.apply_rms_norm(&hidden, &self.final_norm));
             }
         }
+        if trace_timing {
+            println!(
+                "   [PROFILE total_tokens={}] gemm={:.3}s norm={:.3}s rope={:.3}s attn={:.3}s act={:.3}s",
+                total_tokens, t_gemm, t_norm, t_rope, t_attn, t_act
+            );
+        }
 
-        self.apply_rms_norm(&hidden, &self.final_norm)
+        let final_out = self.apply_rms_norm(&hidden, &self.final_norm);
+        if early_layer.is_some() && early_out.is_none() {
+            early_out = Some(final_out.clone());
+        }
+        (early_out, final_out)
+    }
+
+    /// Batch-embed multiple queries in a single packed `cu_seqlens` forward pass across all 24 layers.
+    pub fn begin_queries_batch(&self, query_texts: &[&str]) -> Vec<QuerySession> {
+        let b = query_texts.len();
+        if b == 0 {
+            return Vec::new();
+        }
+        if self.ple_model_proj.is_none() {
+            return query_texts.iter().map(|q| self.begin_query(q)).collect();
+        }
+        let d = self.cfg.hidden_size;
+        let tok_vecs: Vec<Vec<u32>> = query_texts
+            .par_iter()
+            .map(|q| {
+                let full_q = format!("{DEFAULT_QUERY_TASK_PREFIX}{q}");
+                self.tokenize_u32(&full_q)
+            })
+            .collect();
+        let total_toks: usize = tok_vecs.iter().map(|v| v.len()).sum();
+        let mut flat_tokens = Vec::with_capacity(total_toks);
+        let mut cu_seqlens = Vec::with_capacity(b + 1);
+        cu_seqlens.push(0u32);
+        for v in &tok_vecs {
+            flat_tokens.extend_from_slice(v);
+            cu_seqlens.push(flat_tokens.len() as u32);
+        }
+        let batch = PackedTokenBatch {
+            tokens: &flat_tokens,
+            cu_seqlens: &cu_seqlens,
+        };
+        let (early_opt, final_normed) = self.forward_ragged_layers_with_early(
+            batch,
+            Some(self.cfg.early_exit_layer),
+            self.cfg.num_hidden_layers,
+        );
+        let early_normed = early_opt.as_ref().unwrap_or(&final_normed);
+        let pooled_early = self.mean_pool_ragged(early_normed, batch);
+        let pooled_final = self.mean_pool_ragged(&final_normed, batch);
+
+        let mut early_flat = vec![0.0f32; b * MRL_PREFIX_DIMS];
+        let mut final_flat = vec![0.0f32; b * EMBED_DIMS_768];
+        gemm_nt_f32(
+            &pooled_early,
+            &self.w_early_64,
+            &mut early_flat,
+            b,
+            MRL_PREFIX_DIMS,
+            d,
+        );
+        gemm_nt_f32(
+            &pooled_final,
+            &self.w_proj,
+            &mut final_flat,
+            b,
+            EMBED_DIMS_768,
+            d,
+        );
+
+        let mut out = Vec::with_capacity(b);
+        for i in 0..b {
+            let mut query_early_64 = [0.0f32; MRL_PREFIX_DIMS];
+            query_early_64.copy_from_slice(&early_flat[i * MRL_PREFIX_DIMS..(i + 1) * MRL_PREFIX_DIMS]);
+            l2_normalize_slice(&mut query_early_64);
+
+            let mut query_f32 = [0.0f32; EMBED_DIMS_768];
+            query_f32.copy_from_slice(&final_flat[i * EMBED_DIMS_768..(i + 1) * EMBED_DIMS_768]);
+            l2_normalize_slice(&mut query_f32);
+
+            out.push(QuerySession {
+                query_f32,
+                query_early_64,
+            });
+        }
+        out
     }
 
     /// Mean-pool ragged token hidden states `[total_tokens, d_model]` per sequence `[B, d_model]`.
@@ -1547,8 +2093,13 @@ impl UnifiedEmbedder for Gemma2Embedder {
                 cu_seqlens: &cu_seqlens,
             };
 
-            let early_normed = self.forward_ragged_layers(batch, self.cfg.early_exit_layer);
-            let pooled_early = self.mean_pool_ragged(&early_normed, batch);
+            let (early_opt, final_normed) = self.forward_ragged_layers_with_early(
+                batch,
+                Some(self.cfg.early_exit_layer),
+                self.cfg.num_hidden_layers,
+            );
+            let early_normed = early_opt.as_ref().unwrap_or(&final_normed);
+            let pooled_early = self.mean_pool_ragged(early_normed, batch);
             let mut query_early_64 = [0.0f32; MRL_PREFIX_DIMS];
             gemm_nt_f32(
                 &pooled_early,
@@ -1560,7 +2111,6 @@ impl UnifiedEmbedder for Gemma2Embedder {
             );
             l2_normalize_slice(&mut query_early_64);
 
-            let final_normed = self.forward_ragged_layers(batch, self.cfg.num_hidden_layers);
             let pooled_final = self.mean_pool_ragged(&final_normed, batch);
             let mut query_f32 = [0.0f32; EMBED_DIMS_768];
             gemm_nt_f32(
