@@ -113,8 +113,11 @@ pub fn mmse_stratum4_weight(n_blocks: usize) -> f32 {
     }
 }
 
-/// Default Stratum-4 weight for EmbeddingGemma-2 @768 (`B = TAIL_FOLD_BLOCKS = 9`).
-pub const DEFAULT_STRATUM4_WEIGHT: f32 = 1.0 / 3.0; // == mmse_stratum4_weight(9)
+/// Default Stratum-4 weight for EmbeddingGemma-2 @768.
+///
+/// Locked from Stage 2 Pareto sweep: `0.20` beats pure MMSE `1/√9 ≈ 0.333`
+/// on both 1M (R@10 0.881 vs 0.857) and 8.8M (R@10 0.899 vs 0.881) at sl=256.
+pub const DEFAULT_STRATUM4_WEIGHT: f32 = 0.20;
 
 /// IP scale for 64-d folded-tail 1-bit codes (same derivation as RaBitQ).
 #[inline]
