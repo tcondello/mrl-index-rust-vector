@@ -1,10 +1,10 @@
-//! Affine 4-bit MRL prefix + RaBitQ-style 1-bit mid-band quantization.
+//! Affine 4-bit MRL prefix + RaBitQ mid-band + folded-tail stratum4 quantization.
 
 use crate::block::{
     Bitplane64, PaxBlock64, RabitqPlane, VectorMeta, VECTORS_PER_BLOCK, MRL_PREFIX_DIMS,
-    RABITQ_DIMS,
+    RABITQ_DIMS, TAIL_FOLD_DIMS, TAIL_START,
 };
-use crate::rotate::rotate_mid_band;
+use crate::rotate::{rotate_mid_band, rotate_tail_fold};
 
 /// Build a filled PaxBlock64 from up to 64 float vectors (row-major, `dims` each).
 pub fn encode_block(
@@ -35,11 +35,11 @@ pub fn encode_block(
         max_ts = max_ts.max(ts);
         source_mask |= src;
 
-        let (meta, bits4, rabitq) = quantize_vector(vec);
+        let (meta, bits4, rabitq, fold_bits) = quantize_vector(vec);
         block.meta[i] = meta;
         write_4bit_planes(&mut block, i, &bits4);
         write_rabitq_plane(&mut block.stratum1_rabitq, i, &rabitq);
-        write_mid_plane(&mut block.stratum4_mid, i, vec);
+        write_tail_fold_plane(&mut block.stratum4_mid, i, &fold_bits);
     }
 
     // Unused slots are tombstoned so scans skip them.
@@ -57,10 +57,21 @@ pub fn encode_block(
     block
 }
 
-fn quantize_vector(vec: &[f32]) -> (VectorMeta, [u8; MRL_PREFIX_DIMS], [u8; RABITQ_DIMS]) {
+fn quantize_vector(
+    vec: &[f32],
+) -> (
+    VectorMeta,
+    [u8; MRL_PREFIX_DIMS],
+    [u8; RABITQ_DIMS],
+    [u8; TAIL_FOLD_DIMS],
+) {
     let prefix = &vec[..MRL_PREFIX_DIMS];
     let mid = &vec[MRL_PREFIX_DIMS..MRL_PREFIX_DIMS + RABITQ_DIMS];
-    let tail = &vec[MRL_PREFIX_DIMS + RABITQ_DIMS..];
+    let high_tail = if vec.len() > TAIL_START {
+        &vec[TAIL_START..]
+    } else {
+        &[][..]
+    };
 
     let min_v = prefix.iter().copied().fold(f32::INFINITY, f32::min);
     let max_v = prefix.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -82,17 +93,28 @@ fn quantize_vector(vec: &[f32]) -> (VectorMeta, [u8; MRL_PREFIX_DIMS], [u8; RABI
         rabitq[i] = if rotated[i] >= 0.0 { 1 } else { 0 };
     }
 
-    // Residual L2 after the leading MRL prefix (dims 64..) — used for CS bounds.
-    let mut rest_sq = 0.0f32;
-    for &x in mid {
-        rest_sq += x * x;
-    }
-    for &x in tail {
-        rest_sq += x * x;
+    // Step 3: fold high-dim tail → 64-d FWHT → 1-bit codes in stratum4.
+    let folded = rotate_tail_fold(vec);
+    let mut fold_bits = [0u8; TAIL_FOLD_DIMS];
+    for i in 0..TAIL_FOLD_DIMS {
+        fold_bits[i] = if folded[i] >= 0.0 { 1 } else { 0 };
     }
 
-    let meta = VectorMeta::from_f32(scale, offset, rest_sq.sqrt(), 0);
-    (meta, bits4, rabitq)
+    let mut mid_sq = 0.0f32;
+    for &x in mid {
+        mid_sq += x * x;
+    }
+    let mut high_sq = 0.0f32;
+    for &x in high_tail {
+        high_sq += x * x;
+    }
+    let rest_sq = mid_sq + high_sq;
+    let rest_norm = rest_sq.sqrt();
+    let high_norm = high_sq.sqrt();
+    let flags = VectorMeta::pack_rho_flags(high_norm, rest_norm);
+
+    let meta = VectorMeta::from_f32(scale, offset, rest_norm, flags);
+    (meta, bits4, rabitq, fold_bits)
 }
 
 fn write_4bit_planes(block: &mut PaxBlock64, slot: usize, bits4: &[u8; MRL_PREFIX_DIMS]) {
@@ -124,12 +146,10 @@ fn write_rabitq_plane(plane: &mut RabitqPlane, slot: usize, bits: &[u8; RABITQ_D
     }
 }
 
-fn write_mid_plane(plane: &mut Bitplane64, slot: usize, vec: &[f32]) {
+fn write_tail_fold_plane(plane: &mut Bitplane64, slot: usize, bits: &[u8; TAIL_FOLD_DIMS]) {
     let mask = 1u64 << slot;
-    let start = MRL_PREFIX_DIMS;
-    for d in 0..MRL_PREFIX_DIMS {
-        // 1-bit refinement of dims 64..127 (MSB of unsigned mid-grid relative to 0)
-        if vec[start + d] >= 0.0 {
+    for d in 0..TAIL_FOLD_DIMS {
+        if bits[d] != 0 {
             plane.dim_bits[d] |= mask;
         }
     }
@@ -172,7 +192,7 @@ pub fn extract_bits4(block: &PaxBlock64, slot: usize) -> [u8; MRL_PREFIX_DIMS] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::source;
+    use crate::block::{source, EMBED_DIMS_768};
 
     #[test]
     fn encode_roundtrip_bits_and_crc() {
@@ -198,5 +218,34 @@ mod tests {
             "mean abs err too high: {}",
             err / 64.0
         );
+    }
+
+    #[test]
+    fn encode_768_packs_rho_and_stratum4() {
+        let mut v = vec![0.0f32; EMBED_DIMS_768];
+        for (i, x) in v.iter_mut().enumerate() {
+            *x = ((i as f32 * 0.013) % 2.0) - 1.0;
+        }
+        // L2 normalize so norms are well-defined.
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in &mut v {
+            *x /= n;
+        }
+        let block = encode_block(&[&v], &[1], &[source::DOC], EMBED_DIMS_768);
+        let meta = block.meta[0];
+        assert!(meta.flags > 0, "768-d vectors should pack a non-zero ρ");
+        let mid = meta.mid_norm_f32();
+        let high = meta.high_tail_norm_f32();
+        let rest = meta.tail_norm_f32();
+        assert!((mid * mid + high * high - rest * rest).abs() < 1e-3);
+
+        // stratum4 should have a mix of 0/1 bits (not all-zero for random-ish input).
+        let mut ones = 0u32;
+        for d in 0..TAIL_FOLD_DIMS {
+            if block.stratum4_mid.dim_bits[d] & 1 != 0 {
+                ones += 1;
+            }
+        }
+        assert!(ones > 5 && ones < 60, "unexpected stratum4 popcount {ones}");
     }
 }

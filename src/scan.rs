@@ -9,10 +9,11 @@
 use rayon::prelude::*;
 
 use crate::block::{
-    PaxBlock64, VectorId, MRL_PREFIX_DIMS, RABITQ_DIMS, VECTORS_PER_BLOCK,
+    PaxBlock64, VectorId, MRL_PREFIX_DIMS, RABITQ_DIMS, TAIL_FOLD_DIMS, TAIL_START,
+    VECTORS_PER_BLOCK,
 };
 use crate::config::{EngineConfig, StrataDepth};
-use crate::rotate::{rabitq_bit_scale, rotate_mid_band};
+use crate::rotate::{rabitq_bit_scale, rotate_mid_band, rotate_tail_fold, tail_fold_bit_scale};
 
 /// Precomputed query side for bitplane scoring.
 #[derive(Debug, Clone)]
@@ -29,10 +30,16 @@ pub struct QueryPlan {
     pub rabitq_base: f32,
     /// 4-dim LUTs for dense Stratum-1 evaluation (`32 × 16` floats = 2 KiB).
     pub rabitq_lut: [[f32; 16]; RABITQ_DIMS / 4],
-    pub mid_prefix: [f32; MRL_PREFIX_DIMS],
+    /// FWHT(fold(q[192:])) — Step-3 stratum4 query side.
+    pub tail_fold_q: [f32; TAIL_FOLD_DIMS],
+    pub tail_fold_weights2: [f32; TAIL_FOLD_DIMS],
+    pub tail_fold_base: f32,
+    pub has_tail_fold: bool,
+    /// ‖q[192:]‖₂ — high-dim tail only (post-S1 residual).
     pub q_tail_norm: f32,
-    /// ‖q[64..]‖₂ — remainder after leading 64 dims.
+    /// ‖q[64:]‖₂ — remainder after leading 64 dims.
     pub q_after_prefix: f32,
+    /// Alias of `q_tail_norm` (post-S1 residual energy).
     pub q_after_s1: f32,
     /// Σ |q_d| over prefix — for bitplane residual slack.
     pub prefix_l1: f32,
@@ -88,11 +95,8 @@ impl QueryPlan {
             }
         }
 
-        let mut mid_prefix = [0.0f32; MRL_PREFIX_DIMS];
-        mid_prefix.copy_from_slice(&query[MRL_PREFIX_DIMS..MRL_PREFIX_DIMS + MRL_PREFIX_DIMS]);
-
         let mut q_tail_sq = 0.0f32;
-        for &x in &query[MRL_PREFIX_DIMS + RABITQ_DIMS..] {
+        for &x in &query[TAIL_START..] {
             q_tail_sq += x * x;
         }
         let q_tail_norm = q_tail_sq.sqrt();
@@ -103,6 +107,23 @@ impl QueryPlan {
         }
         let q_after_prefix = after_pfx.sqrt();
 
+        let has_tail_fold = dims > TAIL_START;
+        let tail_fold_q = if has_tail_fold {
+            rotate_tail_fold(query)
+        } else {
+            [0.0f32; TAIL_FOLD_DIMS]
+        };
+        let tail_fold_scale = tail_fold_bit_scale();
+        let mut tail_fold_weights2 = [0.0f32; TAIL_FOLD_DIMS];
+        let mut tail_fold_base = 0.0f32;
+        if has_tail_fold {
+            for d in 0..TAIL_FOLD_DIMS {
+                let pos = tail_fold_q[d] * tail_fold_scale;
+                tail_fold_base -= pos;
+                tail_fold_weights2[d] = 2.0 * pos;
+            }
+        }
+
         Self {
             dims,
             prefix,
@@ -112,7 +133,10 @@ impl QueryPlan {
             rabitq_weights2,
             rabitq_base,
             rabitq_lut,
-            mid_prefix,
+            tail_fold_q,
+            tail_fold_weights2,
+            tail_fold_base,
+            has_tail_fold,
             q_tail_norm,
             q_after_prefix,
             q_after_s1: q_tail_norm,
@@ -349,12 +373,26 @@ pub fn scan_block(
         return;
     }
 
+    // Precompute per-survivor mid/high norms once (flags → f16 decode + sqrt).
+    let mut mid_n = [0.0f32; VECTORS_PER_BLOCK];
+    let mut high_n = [0.0f32; VECTORS_PER_BLOCK];
+    {
+        let mut bits = survivors;
+        while bits != 0 {
+            let v = bits.trailing_zeros() as usize;
+            mid_n[v] = block.meta[v].mid_norm_f32().max(1e-6);
+            high_n[v] = block.meta[v].high_tail_norm_f32().max(0.0);
+            bits &= bits - 1;
+        }
+    }
+
     // --- Stratum 1: RaBitQ 1-bit mid-band (dims 64..191), IP-scaled ---
     // Using identity: Σ (2*bit_d - 1)*pos_d = rabitq_base + Σ bit_d * (2*pos_d)
+    // Step 3: scale by per-vector ‖x_mid‖ recovered from flags/ρ.
     let mut s_bits = survivors;
     while s_bits != 0 {
         let v = s_bits.trailing_zeros() as usize;
-        scores[v] += plan.rabitq_base;
+        scores[v] += plan.rabitq_base * mid_n[v];
         s_bits &= s_bits - 1;
     }
 
@@ -363,17 +401,17 @@ pub fn scan_block(
         let w = plan.rabitq_weights2[d];
         while bits != 0 {
             let v = bits.trailing_zeros() as usize;
-            scores[v] += w;
+            scores[v] += w * mid_n[v];
             bits &= bits - 1;
         }
     }
 
-    // Post-S1: residual after prefix+mid is dims ≥ 192.
+    // Post-S1 CS: residual is the high-dim tail only (dims ≥ 192).
     let mut survivors2 = 0u64;
     let mut check_bits = survivors;
     while check_bits != 0 {
         let v = check_bits.trailing_zeros() as usize;
-        let ub = scores[v] + alpha * plan.q_after_s1 * block.meta[v].tail_norm_f32();
+        let ub = scores[v] + alpha * plan.q_after_s1 * high_n[v];
         if ub >= tau {
             survivors2 |= 1u64 << v;
         }
@@ -384,14 +422,29 @@ pub fn scan_block(
         return;
     }
 
-    if matches!(cfg.strata_depth, StrataDepth::L1Rabitq) {
-        finish_push(block_idx, survivors, &scores, shortlist);
-        return;
+    // --- Stratum 4: folded high-dim tail (dims 192..768) → 64-bit FWHT signs ---
+    // Applied for both L1 and Full64b whenever the query has a tail (Step 3).
+    if plan.has_tail_fold {
+        let mut s_bits = survivors;
+        while s_bits != 0 {
+            let v = s_bits.trailing_zeros() as usize;
+            scores[v] += plan.tail_fold_base * high_n[v].max(1e-6);
+            s_bits &= s_bits - 1;
+        }
+        for d in 0..TAIL_FOLD_DIMS {
+            let mut bits = block.stratum4_mid.dim_bits[d] & survivors;
+            let w = plan.tail_fold_weights2[d];
+            while bits != 0 {
+                let v = bits.trailing_zeros() as usize;
+                scores[v] += w * high_n[v].max(1e-6);
+                bits &= bits - 1;
+            }
+        }
     }
 
-    // Stratum 4 is retained on disk for future mid-prefix refinement; do not
-    // perturb the RaBitQ-calibrated score here (empirically hurts ranking).
-
+    // Full64b and L1Rabitq share the same ranking path now that stratum4
+    // carries the folded high-dim tail (Step 3 bit-budget reclaim).
+    let _ = matches!(cfg.strata_depth, StrataDepth::Full64b);
     finish_push(block_idx, survivors, &scores, shortlist);
 }
 

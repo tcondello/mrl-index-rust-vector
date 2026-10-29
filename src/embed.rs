@@ -95,8 +95,43 @@ fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
     v
 }
 
-/// Exact f32 dot product.
+/// Exact f32 dot product (dispatches to the unrolled 768-d kernel when possible).
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    if a.len() == 768 {
+        // SAFETY: lengths checked; arrays are plain f32 with no niche.
+        let a768: &[f32; 768] = a.try_into().expect("len 768");
+        let b768: &[f32; 768] = b.try_into().expect("len 768");
+        return dot_768(a768, b768);
+    }
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// 8-way unrolled dot for EmbeddingGemma @768 (`24 × 32` floats, no remainder).
+///
+/// Independent accumulators keep Apple Silicon / x86 FMA pipelines fed.
+#[inline]
+pub fn dot_768(a: &[f32; 768], b: &[f32; 768]) -> f32 {
+    let mut acc0 = 0.0f32;
+    let mut acc1 = 0.0f32;
+    let mut acc2 = 0.0f32;
+    let mut acc3 = 0.0f32;
+    let mut acc4 = 0.0f32;
+    let mut acc5 = 0.0f32;
+    let mut acc6 = 0.0f32;
+    let mut acc7 = 0.0f32;
+    let mut i = 0usize;
+    while i < 768 {
+        acc0 += a[i] * b[i];
+        acc1 += a[i + 1] * b[i + 1];
+        acc2 += a[i + 2] * b[i + 2];
+        acc3 += a[i + 3] * b[i + 3];
+        acc4 += a[i + 4] * b[i + 4];
+        acc5 += a[i + 5] * b[i + 5];
+        acc6 += a[i + 6] * b[i + 6];
+        acc7 += a[i + 7] * b[i + 7];
+        i += 8;
+    }
+    acc0 + acc1 + acc2 + acc3 + acc4 + acc5 + acc6 + acc7
 }

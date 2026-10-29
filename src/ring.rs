@@ -1,8 +1,8 @@
 //! Append-only ingestion ring buffer with 64-vector flush (spec §1, §5).
 
-use crate::block::{source, VECTORS_PER_BLOCK};
+use crate::block::{source, PaxBlock64, VECTORS_PER_BLOCK};
+use crate::embed::dot;
 use crate::quantize::encode_block;
-use crate::block::PaxBlock64;
 
 #[derive(Debug, Clone)]
 pub struct PendingVector {
@@ -78,15 +78,7 @@ impl RingBuffer {
             .pending
             .iter()
             .enumerate()
-            .map(|(i, p)| {
-                let s: f32 = p
-                    .embedding
-                    .iter()
-                    .zip(query.iter())
-                    .map(|(a, b)| a * b)
-                    .sum();
-                (i, s, p)
-            })
+            .map(|(i, p)| (i, dot(&p.embedding, query), p))
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         scored.truncate(top_k);

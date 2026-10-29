@@ -11,6 +11,14 @@ pub const BLOCK_BYTES: usize = 4096;
 pub const MRL_PREFIX_DIMS: usize = 64;
 pub const RABITQ_DIMS: usize = 128;
 pub const MID_PREFIX_DIMS: usize = 64;
+/// Start of the high-dim tail folded into `stratum4_mid` (after prefix+RaBitQ).
+pub const TAIL_START: usize = MRL_PREFIX_DIMS + RABITQ_DIMS; // 192
+/// Folded tail sketch width (reclaims the previously-idle 512 B stratum4).
+pub const TAIL_FOLD_DIMS: usize = 64;
+/// Max 64-d blocks in the tail for EmbeddingGemma @768 (`(768-192)/64 = 9`).
+pub const TAIL_FOLD_BLOCKS: usize = 9;
+/// Canonical embedding width for Step-3 unrolled kernels.
+pub const EMBED_DIMS_768: usize = 768;
 
 /// Source channel bits in `BlockHeader::source_mask`.
 pub mod source {
@@ -56,8 +64,29 @@ impl VectorMeta {
     pub fn offset_f32(self) -> f32 {
         f16::from_bits(self.offset).to_f32()
     }
+    /// ‖x[64:]‖₂ (mid + high-dim tail residual after the 4-bit MRL prefix).
     pub fn tail_norm_f32(self) -> f32 {
         f16::from_bits(self.tail_norm).to_f32()
+    }
+
+    /// `flags/255 ≈ ‖x[192:]‖₂ / ‖x[64:]‖₂` (Step-3 mid/tail energy split).
+    #[inline]
+    pub fn rho_ratio(self) -> f32 {
+        self.flags as f32 / 255.0
+    }
+
+    /// ‖x[64..192]‖₂ recovered from `tail_norm` and `flags`.
+    #[inline]
+    pub fn mid_norm_f32(self) -> f32 {
+        let t = self.tail_norm_f32().max(0.0);
+        let r = self.rho_ratio().clamp(0.0, 1.0);
+        ((1.0 - r * r).max(0.0).sqrt()) * t
+    }
+
+    /// ‖x[192:]‖₂ recovered from `tail_norm` and `flags`.
+    #[inline]
+    pub fn high_tail_norm_f32(self) -> f32 {
+        self.rho_ratio() * self.tail_norm_f32().max(0.0)
     }
 
     pub fn from_f32(scale: f32, offset: f32, tail_norm: f32, flags: u8) -> Self {
@@ -67,6 +96,15 @@ impl VectorMeta {
             tail_norm: f16::from_f32(tail_norm).to_bits(),
             flags,
         }
+    }
+
+    /// Pack ρ = round(255 · ‖tail‖ / ‖rest‖) into `flags` (0 when no high-dim tail).
+    pub fn pack_rho_flags(high_tail_norm: f32, rest_norm: f32) -> u8 {
+        if rest_norm <= 1e-12 {
+            return 0;
+        }
+        let r = (high_tail_norm / rest_norm).clamp(0.0, 1.0);
+        (r * 255.0).round().clamp(0.0, 255.0) as u8
     }
 }
 
