@@ -4,7 +4,7 @@ use crate::block::{
     Bitplane64, PaxBlock64, RabitqPlane, VectorMeta, VECTORS_PER_BLOCK, MRL_PREFIX_DIMS,
     RABITQ_DIMS, TAIL_FOLD_DIMS, TAIL_START,
 };
-use crate::rotate::{rotate_mid_band, rotate_tail_fold};
+use crate::rotate::{rotate_mid_band, rotate_tail_fold, AUGMENTED_FULL_DIMS};
 
 /// Build a filled PaxBlock64 from up to 64 float vectors (row-major, `dims` each).
 pub fn encode_block(
@@ -43,6 +43,92 @@ pub fn encode_block(
     }
 
     // Unused slots are tombstoned so scans skip them.
+    let mut tomb = 0u64;
+    for i in n..VECTORS_PER_BLOCK {
+        tomb |= 1u64 << i;
+        block.meta[i] = VectorMeta::from_f32(0.0, 0.0, 0.0, 0);
+    }
+
+    block.header.min_timestamp = if n == 0 { 0 } else { min_ts };
+    block.header.max_timestamp = max_ts;
+    block.header.source_mask = source_mask;
+    block.header.tombstone_mask = tomb;
+    block.recompute_crc();
+    block
+}
+
+/// Build a `PaxBlock64` directly from up to 64 pre-rotated augmented vectors
+/// (`[f32; 960]` produced by `W_full = augment_projection_weights(W_proj)`)
+/// without running `rotate_mid_band` or `rotate_tail_fold` at runtime.
+///
+/// Layout of each 960-d slice `aug`:
+/// - `aug[0..768]`: L2-normalized 768-d embedding (prefix `0..64`, mid `64..192`, tail `192..768`)
+/// - `aug[768..896]`: pre-rotated 128-d FWHT mid-band (`H_128 · x_mid`)
+/// - `aug[896..960]`: pre-rotated 64-d folded tail (`(1/3) H_64 · S · x_tail`)
+pub fn encode_block_from_augmented(
+    augmented_vecs: &[[f32; AUGMENTED_FULL_DIMS]],
+    timestamps: &[u32],
+    sources: &[u32],
+) -> PaxBlock64 {
+    assert!(!augmented_vecs.is_empty() && augmented_vecs.len() <= VECTORS_PER_BLOCK);
+    assert_eq!(timestamps.len(), augmented_vecs.len());
+    assert_eq!(sources.len(), augmented_vecs.len());
+
+    let mut block = PaxBlock64::zeroed();
+    let n = augmented_vecs.len();
+
+    let mut min_ts = u32::MAX;
+    let mut max_ts = 0u32;
+    let mut source_mask = 0u32;
+
+    for (i, (aug, (&ts, &src))) in augmented_vecs
+        .iter()
+        .zip(timestamps.iter().zip(sources.iter()))
+        .enumerate()
+    {
+        min_ts = min_ts.min(ts);
+        max_ts = max_ts.max(ts);
+        source_mask |= src;
+
+        let prefix = &aug[..MRL_PREFIX_DIMS];
+        let mid = &aug[MRL_PREFIX_DIMS..MRL_PREFIX_DIMS + RABITQ_DIMS];
+        let high_tail = &aug[TAIL_START..768];
+        let rot_mid = &aug[768..768 + RABITQ_DIMS];
+        let rot_tail = &aug[768 + RABITQ_DIMS..AUGMENTED_FULL_DIMS];
+
+        let min_v = prefix.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_v = prefix.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let range = (max_v - min_v).max(1e-8);
+        let scale = range / 15.0;
+        let offset = min_v;
+
+        let mut bits4 = [0u8; MRL_PREFIX_DIMS];
+        for (d, &x) in prefix.iter().enumerate() {
+            bits4[d] = ((x - offset) / scale).round().clamp(0.0, 15.0) as u8;
+        }
+
+        let mut rabitq = [0u8; RABITQ_DIMS];
+        for d in 0..RABITQ_DIMS {
+            rabitq[d] = if rot_mid[d] >= 0.0 { 1 } else { 0 };
+        }
+
+        let mut fold_bits = [0u8; TAIL_FOLD_DIMS];
+        for d in 0..TAIL_FOLD_DIMS {
+            fold_bits[d] = if rot_tail[d] >= 0.0 { 1 } else { 0 };
+        }
+
+        let mid_sq: f32 = mid.iter().map(|&x| x * x).sum();
+        let high_sq: f32 = high_tail.iter().map(|&x| x * x).sum();
+        let rest_norm = (mid_sq + high_sq).sqrt();
+        let high_norm = high_sq.sqrt();
+        let flags = VectorMeta::pack_rho_flags(high_norm, rest_norm);
+
+        block.meta[i] = VectorMeta::from_f32(scale, offset, rest_norm, flags);
+        write_4bit_planes(&mut block, i, &bits4);
+        write_rabitq_plane(&mut block.stratum1_rabitq, i, &rabitq);
+        write_tail_fold_plane(&mut block.stratum4_mid, i, &fold_bits);
+    }
+
     let mut tomb = 0u64;
     for i in n..VECTORS_PER_BLOCK {
         tomb |= 1u64 << i;
@@ -247,5 +333,63 @@ mod tests {
             }
         }
         assert!(ones > 5 && ones < 60, "unexpected stratum4 popcount {ones}");
+    }
+
+    #[test]
+    fn encode_block_from_augmented_is_bit_identical_to_encode_block() {
+        use crate::rotate::augment_projection_weights;
+
+        let d_model = 16usize;
+        let mut w_proj = vec![0.0f32; 768 * d_model];
+        for (i, w) in w_proj.iter_mut().enumerate() {
+            *w = ((i * 19 + 5) % 97) as f32 * 0.01 - 0.48;
+        }
+        let w_full = augment_projection_weights(&w_proj, d_model);
+
+        let mut vecs_768 = Vec::new();
+        let mut vecs_960 = Vec::new();
+        let mut ts = Vec::new();
+        let mut srcs = Vec::new();
+
+        for v_idx in 0..8usize {
+            let mut h = vec![0.0f32; d_model];
+            for c in 0..d_model {
+                h[c] = (((v_idx * 31 + c * 17 + 3) % 89) as f32) * 0.02 - 0.85;
+            }
+            let mut raw768 = [0.0f32; 768];
+            for r in 0..768 {
+                let mut s = 0.0f32;
+                for c in 0..d_model {
+                    s += w_proj[r * d_model + c] * h[c];
+                }
+                raw768[r] = s;
+            }
+            let norm = raw768.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            let inv_norm = 1.0 / norm;
+            for x in &mut raw768 {
+                *x *= inv_norm;
+            }
+
+            let mut aug960 = [0.0f32; AUGMENTED_FULL_DIMS];
+            for r in 0..AUGMENTED_FULL_DIMS {
+                let mut s = 0.0f32;
+                for c in 0..d_model {
+                    s += w_full[r * d_model + c] * h[c];
+                }
+                aug960[r] = s * inv_norm;
+            }
+
+            vecs_768.push(raw768.to_vec());
+            vecs_960.push(aug960);
+            ts.push(1000 + v_idx as u32);
+            srcs.push(source::DOC);
+        }
+
+        let refs_768: Vec<&[f32]> = vecs_768.iter().map(|v| v.as_slice()).collect();
+        let block_std = encode_block(&refs_768, &ts, &srcs, 768);
+        let block_aug = encode_block_from_augmented(&vecs_960, &ts, &srcs);
+
+        assert_eq!(block_std.as_bytes(), block_aug.as_bytes());
+        assert_eq!(block_std.header.crc32c, block_aug.header.crc32c);
     }
 }

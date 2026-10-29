@@ -150,3 +150,65 @@ fn page_align_helper() {
     assert_eq!(mrl_index::passage::align_page(1), 16384);
     assert_eq!(mrl_index::passage::align(100, 64), 128);
 }
+
+#[test]
+fn unified_gemma2_ingest_and_query_roundtrip() {
+    use mrl_index::{Gemma2Config, Gemma2Embedder};
+
+    let dir = tempdir().unwrap();
+    let mut cfg = EngineConfig::default();
+    cfg.embed_dims = 768;
+    cfg.strata_depth = StrataDepth::Full64b;
+    cfg.shortlist_cand = 64;
+    cfg.final_top_k = 5;
+
+    let embedder = Gemma2Embedder::new_deterministic(Gemma2Config::micro_test(), 2026);
+    let mut engine = IndexEngine::create(dir.path(), cfg)
+        .unwrap()
+        .with_gemma2_embedder(embedder);
+
+    // 64 passages flush directly via zero-FWHT `ingest_packed_to_paxblocks`;
+    // 6 tail passages remain in the ring buffer to test hybrid disk + ring unified search.
+    let mut items = Vec::with_capacity(70);
+    for i in 0..70 {
+        let text = if i == 42 {
+            "quantum superconducting transmon qubit coherence time".to_string()
+        } else if i == 67 {
+            "ring buffer instant visibility for freshly ingested passages".to_string()
+        } else {
+            format!("synthetic passage number {i} discussing distributed systems and consensus")
+        };
+        items.push((text, 1000 + i as u32, source::DOC));
+    }
+
+    let ids = engine.ingest_batch(&items).unwrap();
+    assert_eq!(ids.len(), 70);
+    assert_eq!(engine.block_count(), 1);
+    assert_eq!(engine.passage_count(), 70);
+
+    // Query a passage stored in the flushed PaxBlock64 on disk (via u32 token shortlist)
+    let res_disk = engine
+        .query("quantum superconducting transmon qubit coherence time")
+        .unwrap();
+    assert_eq!(res_disk.hits.len(), 5);
+    assert_eq!(res_disk.hits[0].passage_id, 42);
+    assert!(
+        res_disk.hits[0].text.contains("transmon qubit"),
+        "deferred top-k text fetch failed: {}",
+        res_disk.hits[0].text
+    );
+
+    // Query a passage still residing in the uncommitted ring buffer.
+    // Note: query uses the asymmetric pinned `PrefixKVCache` ("task: search result | query: "),
+    // while passages are embedded without the query prefix, yielding cosine ~0.81 and rank #1.
+    let res_ring = engine
+        .query("ring buffer instant visibility for freshly ingested passages")
+        .unwrap();
+    assert_eq!(res_ring.hits.len(), 5);
+    assert_eq!(res_ring.hits[0].passage_id, 67);
+    assert!(
+        res_ring.hits[0].exact_score > 0.75,
+        "expected top-1 asymmetric query-doc dot > 0.75, got {}",
+        res_ring.hits[0].exact_score
+    );
+}

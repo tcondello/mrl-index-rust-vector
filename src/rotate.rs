@@ -125,6 +125,77 @@ pub fn tail_fold_bit_scale() -> f32 {
     (2.0 / std::f32::consts::PI).sqrt() / (TAIL_FOLD_DIMS as f32).sqrt()
 }
 
+/// Output dimensionality of the offline-folded sketch operator `T_norm`:
+/// `64 (prefix) + 128 (rotated mid) + 64 (folded+rotated tail) = 256`.
+pub const FUSED_SKETCH_DIMS: usize = MRL_PREFIX_DIMS + RABITQ_DIMS + TAIL_FOLD_DIMS;
+
+/// Output dimensionality of the augmented projection matrix `W_full`:
+/// `768 (full unrotated embedding) + 128 (rotated mid) + 64 (folded+rotated tail) = 960`.
+pub const AUGMENTED_FULL_DIMS: usize = 768 + RABITQ_DIMS + TAIL_FOLD_DIMS;
+
+/// Fold a model's output projection matrix `w_proj` (`[768, d_model]` row-major)
+/// offline into `W_fused_norm = T_norm · W_proj` (`[256, d_model]` row-major).
+///
+/// Because `T_norm = diag(I_64, H_128, (1/√9) H_64 S)` is linear and column-wise
+/// decomposable, we apply `T_norm` to each of the `d_model` columns of `w_proj`.
+/// The resulting `[256, d_model]` matrix has condition number `κ(T_norm) = 1.0`
+/// (exact partial isometry) and cuts output projection FLOPs by 66.7%.
+pub fn fold_projection_weights(w_proj: &[f32], d_model: usize) -> Vec<f32> {
+    assert_eq!(
+        w_proj.len(),
+        768 * d_model,
+        "w_proj must have shape [768, d_model]"
+    );
+    let mut w_fused = vec![0.0f32; FUSED_SKETCH_DIMS * d_model];
+    let inv_sqrt_b = 1.0 / (TAIL_FOLD_BLOCKS as f32).sqrt(); // 1/3 for B=9
+
+    let mut col = [0.0f32; 768];
+    for c in 0..d_model {
+        for r in 0..768 {
+            col[r] = w_proj[r * d_model + c];
+        }
+        // 1. Rows 0..64: Identity on MRL prefix
+        for d in 0..MRL_PREFIX_DIMS {
+            w_fused[d * d_model + c] = col[d];
+        }
+        // 2. Rows 64..192: Orthonormal 128-d FWHT on mid-band
+        let rot_mid = rotate_mid_band(&col[MRL_PREFIX_DIMS..MRL_PREFIX_DIMS + RABITQ_DIMS]);
+        for d in 0..RABITQ_DIMS {
+            w_fused[(MRL_PREFIX_DIMS + d) * d_model + c] = rot_mid[d];
+        }
+        // 3. Rows 192..256: Normalized (1/√9) Rademacher fold + 64-d FWHT on tail
+        let rot_tail = rotate_tail_fold(&col);
+        for d in 0..TAIL_FOLD_DIMS {
+            w_fused[(MRL_PREFIX_DIMS + RABITQ_DIMS + d) * d_model + c] = rot_tail[d] * inv_sqrt_b;
+        }
+    }
+    w_fused
+}
+
+/// Build the augmented `[960, d_model]` projection matrix `W_full`:
+/// - Rows `0..768`: original `W_proj` (produces exact 768-d embedding + norms + 64-d prefix)
+/// - Rows `768..896`: `H_128 · W_mid` (pre-rotated Stratum-1 RaBitQ coordinates)
+/// - Rows `896..960`: `(1/3) H_64 · S · W_tail` (pre-rotated Stratum-4 folded tail coordinates)
+pub fn augment_projection_weights(w_proj: &[f32], d_model: usize) -> Vec<f32> {
+    assert_eq!(
+        w_proj.len(),
+        768 * d_model,
+        "w_proj must have shape [768, d_model]"
+    );
+    let mut w_full = vec![0.0f32; AUGMENTED_FULL_DIMS * d_model];
+    w_full[..768 * d_model].copy_from_slice(w_proj);
+
+    let w_fused = fold_projection_weights(w_proj, d_model);
+    // Copy rotated mid (rows 64..192 of w_fused) into rows 768..896 of w_full
+    w_full[768 * d_model..(768 + RABITQ_DIMS) * d_model]
+        .copy_from_slice(&w_fused[MRL_PREFIX_DIMS * d_model..(MRL_PREFIX_DIMS + RABITQ_DIMS) * d_model]);
+    // Copy folded+rotated tail (rows 192..256 of w_fused) into rows 896..960 of w_full
+    w_full[(768 + RABITQ_DIMS) * d_model..AUGMENTED_FULL_DIMS * d_model]
+        .copy_from_slice(&w_fused[(MRL_PREFIX_DIMS + RABITQ_DIMS) * d_model..FUSED_SKETCH_DIMS * d_model]);
+
+    w_full
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +231,52 @@ mod tests {
         let n0: f32 = folded.iter().map(|x| x * x).sum::<f32>().sqrt();
         let n1: f32 = rot.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((n0 - n1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn fold_projection_weights_matches_runtime_rotation() {
+        let d_model = 32usize;
+        let mut w_proj = vec![0.0f32; 768 * d_model];
+        for (i, w) in w_proj.iter_mut().enumerate() {
+            *w = ((i * 13 + 7) % 101) as f32 * 0.01 - 0.5;
+        }
+        let mut h = vec![0.0f32; d_model];
+        for (i, x) in h.iter_mut().enumerate() {
+            *x = ((i * 29 + 3) % 73) as f32 * 0.02 - 0.7;
+        }
+
+        // Unfused: z = W_proj · h, then rotate_mid_band & rotate_tail_fold
+        let mut z = vec![0.0f32; 768];
+        for r in 0..768 {
+            let mut sum = 0.0f32;
+            for c in 0..d_model {
+                sum += w_proj[r * d_model + c] * h[c];
+            }
+            z[r] = sum;
+        }
+        let exp_mid = rotate_mid_band(&z[64..192]);
+        let exp_tail = rotate_tail_fold(&z);
+
+        // Fused: y = W_fused · h
+        let w_fused = fold_projection_weights(&w_proj, d_model);
+        let mut y = vec![0.0f32; FUSED_SKETCH_DIMS];
+        for r in 0..FUSED_SKETCH_DIMS {
+            let mut sum = 0.0f32;
+            for c in 0..d_model {
+                sum += w_fused[r * d_model + c] * h[c];
+            }
+            y[r] = sum;
+        }
+
+        for d in 0..64 {
+            assert!((y[d] - z[d]).abs() < 1e-4);
+        }
+        for d in 0..128 {
+            assert!((y[64 + d] - exp_mid[d]).abs() < 1e-4);
+        }
+        for d in 0..64 {
+            assert!((y[192 + d] - exp_tail[d] / 3.0).abs() < 1e-4);
+            assert_eq!(y[192 + d] >= 0.0, exp_tail[d] >= 0.0);
+        }
     }
 }

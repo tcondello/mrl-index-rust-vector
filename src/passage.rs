@@ -45,6 +45,43 @@ const INDEX_ENTRY_BYTES: usize = 24;
 
 /// Flag bit: record carries a non-empty token span.
 pub const FLAG_HAS_TOKENS: u16 = 1;
+/// Flag bit: token span is stored as little-endian `u32` (for Gemma-2 262,144 vocab).
+pub const FLAG_TOKENS_U32: u16 = 2;
+
+/// High bit in `PassageIndexEntry::token_len` indicating 4-byte `u32` token storage.
+const TOKEN_LEN_U32_BIT: u32 = 1 << 31;
+const TOKEN_LEN_MASK: u32 = 0x7fff_ffff;
+
+/// Contiguous ragged `u32` token batch read in LBA order (`cu_seqlens` layout).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnedPackedTokenBatch {
+    /// Passage IDs corresponding to each sequence `i` in `0..num_sequences()`.
+    pub ids: Vec<u64>,
+    /// Flattened 1D token stream across all sequences (zero `<pad>` tokens).
+    pub tokens: Vec<u32>,
+    /// Cumulative sequence offsets of length `ids.len() + 1`:
+    /// sequence `i` spans `tokens[cu_seqlens[i] as usize .. cu_seqlens[i+1] as usize]`.
+    pub cu_seqlens: Vec<u32>,
+}
+
+impl OwnedPackedTokenBatch {
+    pub fn num_sequences(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn sequence(&self, i: usize) -> &[u32] {
+        let start = self.cu_seqlens[i] as usize;
+        let end = self.cu_seqlens[i + 1] as usize;
+        &self.tokens[start..end]
+    }
+
+    pub fn as_view(&self) -> crate::rerank::PackedTokenBatch<'_> {
+        crate::rerank::PackedTokenBatch {
+            tokens: &self.tokens,
+            cu_seqlens: &self.cu_seqlens,
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -52,10 +89,22 @@ pub struct PassageIndexEntry {
     /// Absolute file offset of UTF-8 text bytes.
     pub file_offset: u64,
     pub text_len: u32,
-    /// Number of `u16` token IDs (0 = none).
+    /// Number of token IDs (low 31 bits); bit 31 = 1 if stored as `u32`, 0 if `u16`.
     pub token_len: u32,
-    /// Absolute file offset of the `u16` token span (0 if `token_len == 0`).
+    /// Absolute file offset of the token span (0 if `token_count() == 0`).
     pub token_offset: u64,
+}
+
+impl PassageIndexEntry {
+    #[inline]
+    pub fn token_count(self) -> usize {
+        (self.token_len & TOKEN_LEN_MASK) as usize
+    }
+
+    #[inline]
+    pub fn is_u32_tokens(self) -> bool {
+        (self.token_len & TOKEN_LEN_U32_BIT) != 0
+    }
 }
 
 const _: () = assert!(std::mem::size_of::<PassageIndexEntry>() == INDEX_ENTRY_BYTES);
@@ -265,6 +314,88 @@ impl PassageStore {
         Ok(id)
     }
 
+    /// Append with an explicit `u32` token span (supports Gemma-2's 262,144 SentencePiece vocabulary).
+    pub fn append_with_tokens_u32(
+        &mut self,
+        mut record: PassageRecord,
+        tokens: &[u32],
+    ) -> Result<u64, PassageError> {
+        let id = self.entries.len() as u64;
+        record.id = id;
+
+        let record_offset = self.flushed_offset + self.unflushed_data.len() as u64;
+        let text_offset = record_offset + RECORD_HEADER_BYTES;
+        let text_bytes = record.text.as_bytes();
+        let text_len = text_bytes.len() as u32;
+
+        let meta_empty = record.meta.is_null()
+            || record
+                .meta
+                .as_object()
+                .map_or(false, |obj| obj.is_empty());
+        let meta_bytes = if meta_empty {
+            Vec::new()
+        } else {
+            serde_json::to_vec(&record.meta)?
+        };
+        let meta_len = meta_bytes.len() as u32;
+        let token_len_u16 = tokens.len().min(u16::MAX as usize) as u16;
+        let flags = if !tokens.is_empty() {
+            FLAG_HAS_TOKENS | FLAG_TOKENS_U32
+        } else {
+            0
+        };
+
+        self.unflushed_data.extend_from_slice(&id.to_le_bytes());
+        self.unflushed_data
+            .extend_from_slice(&record.timestamp.to_le_bytes());
+        self.unflushed_data
+            .extend_from_slice(&record.source.to_le_bytes());
+        self.unflushed_data
+            .extend_from_slice(&text_len.to_le_bytes());
+        self.unflushed_data
+            .extend_from_slice(&meta_len.to_le_bytes());
+        self.unflushed_data
+            .extend_from_slice(&token_len_u16.to_le_bytes());
+        self.unflushed_data
+            .extend_from_slice(&flags.to_le_bytes());
+        self.unflushed_data.extend_from_slice(text_bytes);
+        if !meta_bytes.is_empty() {
+            self.unflushed_data.extend_from_slice(&meta_bytes);
+        }
+        let token_offset = if tokens.is_empty() {
+            0
+        } else {
+            let off = self.flushed_offset + self.unflushed_data.len() as u64;
+            for &t in tokens {
+                self.unflushed_data.extend_from_slice(&t.to_le_bytes());
+            }
+            off
+        };
+
+        let encoded_token_len = if tokens.is_empty() {
+            0
+        } else {
+            (tokens.len() as u32 & TOKEN_LEN_MASK) | TOKEN_LEN_U32_BIT
+        };
+
+        let entry = PassageIndexEntry {
+            file_offset: text_offset,
+            text_len,
+            token_len: encoded_token_len,
+            token_offset,
+        };
+        self.entries.push(entry);
+        self.unflushed_idx
+            .extend_from_slice(bytemuck::bytes_of(&entry));
+
+        if self.unflushed_data.len() >= AUTO_FLUSH_BYTES {
+            self.flush()?;
+        }
+
+        Ok(id)
+    }
+
     #[inline]
     pub fn entry(&self, id: u64) -> Result<PassageIndexEntry, PassageError> {
         self.entries
@@ -306,19 +437,74 @@ impl PassageStore {
     /// Fetch pre-tokenized `u16` IDs for one passage (empty if none stored).
     pub fn fetch_tokens(&self, id: u64) -> Result<Vec<u16>, PassageError> {
         let entry = self.entry(id)?;
-        if entry.token_len == 0 {
+        let count = entry.token_count();
+        if count == 0 {
             return Ok(Vec::new());
         }
-        let nbytes = entry.token_len as usize * 2;
+        if entry.is_u32_tokens() {
+            let nbytes = count * 4;
+            let buf = self.read_range(entry.token_offset, nbytes)?;
+            if buf.len() != nbytes {
+                return Err(PassageError::CorruptTokens(id));
+            }
+            let mut out = Vec::with_capacity(count);
+            for chunk in buf.chunks_exact(4) {
+                let v = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                out.push((v & 0xffff) as u16);
+            }
+            return Ok(out);
+        }
+        let nbytes = count * 2;
         let buf = self.read_range(entry.token_offset, nbytes)?;
         if buf.len() != nbytes {
             return Err(PassageError::CorruptTokens(id));
         }
-        let mut out = Vec::with_capacity(entry.token_len as usize);
+        let mut out = Vec::with_capacity(count);
         for chunk in buf.chunks_exact(2) {
             out.push(u16::from_le_bytes([chunk[0], chunk[1]]));
         }
         Ok(out)
+    }
+
+    /// Fetch pre-tokenized `u32` IDs for one passage (seamlessly promotes `u16` spans if stored as v2 `u16`).
+    pub fn fetch_tokens_u32(&self, id: u64) -> Result<Vec<u32>, PassageError> {
+        let entry = self.entry(id)?;
+        self.read_entry_tokens_u32(id, entry)
+    }
+
+    #[inline]
+    fn read_entry_tokens_u32(
+        &self,
+        id: u64,
+        entry: PassageIndexEntry,
+    ) -> Result<Vec<u32>, PassageError> {
+        let count = entry.token_count();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if entry.is_u32_tokens() {
+            let nbytes = count * 4;
+            let buf = self.read_range(entry.token_offset, nbytes)?;
+            if buf.len() != nbytes {
+                return Err(PassageError::CorruptTokens(id));
+            }
+            let mut out = Vec::with_capacity(count);
+            for chunk in buf.chunks_exact(4) {
+                out.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            Ok(out)
+        } else {
+            let nbytes = count * 2;
+            let buf = self.read_range(entry.token_offset, nbytes)?;
+            if buf.len() != nbytes {
+                return Err(PassageError::CorruptTokens(id));
+            }
+            let mut out = Vec::with_capacity(count);
+            for chunk in buf.chunks_exact(2) {
+                out.push(u16::from_le_bytes([chunk[0], chunk[1]]) as u32);
+            }
+            Ok(out)
+        }
     }
 
     /// Batch fetch token spans sorted by ascending `token_offset` (LBA order).
@@ -331,12 +517,22 @@ impl PassageStore {
 
         let mut results: Vec<(usize, u64, Vec<u16>)> = Vec::with_capacity(reqs.len());
         for (orig_idx, id, entry) in reqs {
-            let tokens = if entry.token_len == 0 {
+            let count = entry.token_count();
+            let tokens = if count == 0 {
                 Vec::new()
-            } else {
-                let nbytes = entry.token_len as usize * 2;
+            } else if entry.is_u32_tokens() {
+                let nbytes = count * 4;
                 let buf = self.read_range(entry.token_offset, nbytes)?;
-                let mut out = Vec::with_capacity(entry.token_len as usize);
+                let mut out = Vec::with_capacity(count);
+                for chunk in buf.chunks_exact(4) {
+                    let v = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    out.push((v & 0xffff) as u16);
+                }
+                out
+            } else {
+                let nbytes = count * 2;
+                let buf = self.read_range(entry.token_offset, nbytes)?;
+                let mut out = Vec::with_capacity(count);
                 for chunk in buf.chunks_exact(2) {
                     out.push(u16::from_le_bytes([chunk[0], chunk[1]]));
                 }
@@ -346,6 +542,42 @@ impl PassageStore {
         }
         results.sort_unstable_by_key(|r| r.0);
         Ok(results.into_iter().map(|(_, id, t)| (id, t)).collect())
+    }
+
+    /// Batch fetch `u32` token spans in LBA order and pack them into a single zero-padding
+    /// [`OwnedPackedTokenBatch`] (`tokens` + `cu_seqlens`) in caller ID order.
+    pub fn fetch_tokens_packed(&self, ids: &[u64]) -> Result<OwnedPackedTokenBatch, PassageError> {
+        let mut reqs: Vec<(usize, u64, PassageIndexEntry)> = Vec::with_capacity(ids.len());
+        let mut total_tokens = 0usize;
+        for (orig_idx, &id) in ids.iter().enumerate() {
+            let entry = self.entry(id)?;
+            total_tokens += entry.token_count();
+            reqs.push((orig_idx, id, entry));
+        }
+        reqs.sort_unstable_by_key(|r| r.2.token_offset);
+
+        let mut results: Vec<(usize, u64, Vec<u32>)> = Vec::with_capacity(reqs.len());
+        for (orig_idx, id, entry) in reqs {
+            let toks = self.read_entry_tokens_u32(id, entry)?;
+            results.push((orig_idx, id, toks));
+        }
+        results.sort_unstable_by_key(|r| r.0);
+
+        let mut out_ids = Vec::with_capacity(ids.len());
+        let mut tokens = Vec::with_capacity(total_tokens);
+        let mut cu_seqlens = Vec::with_capacity(ids.len() + 1);
+        cu_seqlens.push(0);
+        for (_, id, toks) in results {
+            out_ids.push(id);
+            tokens.extend_from_slice(&toks);
+            cu_seqlens.push(tokens.len() as u32);
+        }
+
+        Ok(OwnedPackedTokenBatch {
+            ids: out_ids,
+            tokens,
+            cu_seqlens,
+        })
     }
 
     pub fn fetch_record(&self, id: u64) -> Result<PassageRecord, PassageError> {
