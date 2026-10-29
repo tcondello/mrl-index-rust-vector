@@ -625,6 +625,7 @@ pub struct PrecisionRerankReport {
     pub precision: String,
     pub bytes_per_vec: usize,
     pub reranked_recall_at_10: f64,
+    pub qrels_recall_at_10: f64,
     pub qrels_ndcg_at_10: f64,
     /// Fraction of fp32 R@10 retained (1.0 = perfect parity).
     pub recall_parity_vs_fp32: f64,
@@ -674,6 +675,7 @@ pub fn run_precision_rerank_bench(
         RerankPrecision::Int8,
     ];
     let mut r10 = [0.0f64; 3];
+    let mut qrels_r10 = [0.0f64; 3];
     let mut ndcg = [0.0f64; 3];
     let mut qrels_n = 0usize;
     let mut rerank_us = [0.0f64; 3];
@@ -705,6 +707,7 @@ pub fn run_precision_rerank_bench(
                 if pi == 0 {
                     qrels_n += 1;
                 }
+                qrels_r10[pi] += recall_at_k(rels, &rerank_ids, 10);
                 ndcg[pi] += ndcg_at_k(rels, &rerank_ids, 10);
             }
         }
@@ -733,6 +736,7 @@ pub fn run_precision_rerank_bench(
             precision: prec.as_str().into(),
             bytes_per_vec: prec.bytes_per_vec(),
             reranked_recall_at_10: rr,
+            qrels_recall_at_10: qrels_r10[pi] / qrels_denom,
             qrels_ndcg_at_10: ndcg[pi] / qrels_denom,
             recall_parity_vs_fp32: if fp32_r10 > 0.0 {
                 rr / fp32_r10

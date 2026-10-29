@@ -1,0 +1,16 @@
+{
+  "label": "8.8m_sl256-fp16",
+  "corpus": "BeIR/msmarco / data/msmarco_gemma2/full_bin",
+  "n_vectors": 8841823,
+  "n_queries": 6980,
+  "shortlist": 256,
+  "precision": "fp16",
+  "bytes_per_vec": 1536,
+  "reranked_recall_at_10": 0.8987535816618819,
+  "qrels_recall_at_10": 0.5283906399235914,
+  "qrels_ndcg_at_10": 0.33193565159513383,
+  "recall_parity_vs_fp32": 1.0,
+  "mean_rerank_us": 645.9919458452724,
+  "mean_scan_ms": 234.95080192320938,
+  "encode_ms": 52044.817553
+}

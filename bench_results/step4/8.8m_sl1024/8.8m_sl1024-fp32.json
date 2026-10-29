@@ -1,0 +1,16 @@
+{
+  "label": "8.8m_sl1024-fp32",
+  "corpus": "BeIR/msmarco / data/msmarco_gemma2/full_bin",
+  "n_vectors": 8841823,
+  "n_queries": 6980,
+  "shortlist": 1024,
+  "precision": "fp32",
+  "bytes_per_vec": 3072,
+  "reranked_recall_at_10": 0.9633237822349489,
+  "qrels_recall_at_10": 0.5389684813753584,
+  "qrels_ndcg_at_10": 0.33645412058238866,
+  "recall_parity_vs_fp32": 1.0,
+  "mean_rerank_us": 37080.007308166176,
+  "mean_scan_ms": 252.70434186891083,
+  "encode_ms": 29539.619338
+}

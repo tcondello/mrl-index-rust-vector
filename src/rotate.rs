@@ -87,8 +87,8 @@ pub fn fold_tail(vec: &[f32]) -> [f32; TAIL_FOLD_DIMS] {
         }
     }
     // Intentionally unscaled: encode takes `sign(FWHT(u))`, which is invariant to
-    // any positive scale. MMSE / Wiener shrinkage of the Stratum-4 estimator is
-    // applied query-side via `EngineConfig::stratum4_weight` (default `1/√B`).
+    // any positive scale. Stratum-4 shrinkage is applied query-side via
+    // `EngineConfig::stratum4_weight` (locked default `0.20` from Stage 2 sweep).
     u
 }
 

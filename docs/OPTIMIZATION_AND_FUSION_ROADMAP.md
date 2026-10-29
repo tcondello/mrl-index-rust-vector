@@ -30,11 +30,12 @@ flowchart TD
     S2["Step 2: SWAR/SIMD + Rayon + passages.bin (Done)\n~8× MS MARCO scan; Mac 13× microbench"]
     S25["Step 2.5: Shortlist calibration (Done)\nsl64→1024; 8.8M ANN 0.60→0.89"]
     S3["Step 3: Fold 576-d tail into stratum4 (Done)\n8.8M ANN 0.89→0.95 @sl1024"]
-    S4["Step 4: fp16 / int8 pipeline (Next)"]
-    S5["Step 5: passages.bin v2 tokens + 16 KiB pages"]
+    S35["Step 3.5: MMSE + w_s4=0.20 lock (Done)\n8.8M@sl256 ANN 0.881→0.899"]
+    S4["Step 4: fp16 / int8 pipeline (Done)\nfp16 100% parity; int8 ~98–99%"]
+    S5["Step 5: passages.bin v2 tokens + 16 KiB pages (Done)"]
     S6["Step 6: Metal / MLX / ANE kernel fusion"]
 
-    S1 --> S2 --> S25 --> S3 --> S4 --> S5 --> S6
+    S1 --> S2 --> S25 --> S3 --> S35 --> S4 --> S5 --> S6
 ```
 
 ---
@@ -90,18 +91,18 @@ flowchart TD
 * **Success metric (MS MARCO full)**: Match or beat shortlist-1024 ANN R@10 (**≥ 0.887**) at shortlist **≤ 256**, and/or raise ANN R@10 at shortlist 1024 toward **≥ 0.95**.
 * **Changes**:
   1. **Fold the 576-d Tail (`192..768`) into `stratum4_mid` (`512 B`)** (`src/rotate.rs`, `src/quantize.rs`):
-     * Fold the $9 \times 64$ tail blocks into 64 dims via block Rademacher signs + 64-point FWHT (`1/\sqrt{n_{\text{blocks}}}` scale) and store `sign(FWHT(u))` in `stratum4_mid`.
+     * Fold the $9 \times 64$ tail blocks into 64 dims via block Rademacher signs + 64-point FWHT and store `sign(FWHT(u))` in `stratum4_mid` (encode is scale-invariant).
      * Scan ranks with the same RaBitQ-style IP-scaled 1-bit accumulator, weighted by recovered ‖x_tail‖ (`src/scan.rs`).
   2. **Pack Mid/Tail Norm Ratio into `VectorMeta::flags` (`u8`)**:
      * Store $\rho = \text{round}\!\left(255 \cdot \lVert x[192..768] \rVert_2 / \lVert x[64..768] \rVert_2\right)$.
      * Recover $\lVert x_{\text{mid}} \rVert_2$ (weights Stratum 1) and $\lVert x_{\text{tail}} \rVert_2$ (tighter post-S1 CS).
   3. **8-Way Unrolled `dot_768`** (`src/embed.rs`):
      * `dot()` dispatches to `dot_768` for length-768 slices (ring search + retrieval rerank). `PendingVector` stays `Vec<f32>` so 384-d demos keep working.
-* **Measured Impact (MS MARCO + EmbeddingGemma-2 @768)**:
+* **Measured Impact (MS MARCO + EmbeddingGemma-2 @768)** — Stage 1 @ `4e608f2` with `w_s4 = 1/√9`:
 
   | Config | ANN R@10 before → after | Notes |
   |--------|-------------------------|-------|
-  | 1M / sl256 | 0.753 → **0.857** | |
+  | 1M / sl256 | 0.753 → **0.857** | ~30 ms/q |
   | 1M / sl1024 | 0.873 → **0.939** | |
   | 8.8M / sl256 | (~0.75 w/o fold) → **0.881** | Near 0.887 target |
   | 8.8M / sl1024 | 0.887 → **0.952** | **PASS ≥ 0.95** |
@@ -110,27 +111,50 @@ flowchart TD
 
 ---
 
-### Step 4: Low-Precision Vector Pipeline (`fp16` / `int8`)
-* **Objective**: Halve (or quarter) memory bandwidth in the ring buffer, query plan, and JIT reranker while matching native Apple Silicon GPU/ANE precision.
-* **Changes**:
-  1. **`fp16` Native Output from Embedder (`[f16; 768]`)**:
-     * `PaxBlock64` already stores metadata in `f16` and quantizes coordinates to 4-bit/1-bit; feeding `[f16; 768]` into `encode_block` has zero quantization loss.
-     * In `RingBuffer` and `rerank_batch`, `[f16; 768]` cuts memory footprint from `3,072 B` to `1,536 B` per vector and uses ARMv8.2-FP16 `vfmaq_f16` (8 lanes per instruction).
-  2. **Optional Symmetric `int8` Rerank Cache (`[i8; 768]` + `f16` scale)**:
-     * Uses ARM NEON `vdotq_s32` (16-way `i8` dot product per instruction, `768 B/vec`) with $>99.6\%$ Recall@10 parity vs. `fp32`.
+### Step 3.5: Query-Side Stratum-4 Weight Lock (`w_s4 = 0.20`) *(Completed)*
+* **Objective**: Push `8.8M @ sl=256` ANN R@10 from 0.881 to **≥ 0.887** without re-encoding.
+* **Changes**: Moved fold shrinkage out of `fold_tail` into `EngineConfig::stratum4_weight` (encode-once Pareto sweep). Locked **`DEFAULT_STRATUM4_WEIGHT = 0.20`** (beats pure MMSE `1/√9 ≈ 0.333`). `cs_tolerance` ∈ `{1.00, 1.05, 1.10}` was inert.
+* **Measured Impact**:
+
+  | Config | `w_s4=0.333` | **`w_s4=0.20`** |
+  |--------|-------------:|----------------:|
+  | 1M / sl256 ANN R@10 | 0.857 | **0.881** |
+  | 8.8M / sl256 ANN R@10 | 0.881 | **0.899** (**PASS ≥ 0.887**) |
+
+  See `bench_results/step3/pareto_sweep.md`.
 
 ---
 
-### Step 5: Storage-Level Token & Page Fusion (`passages.bin` v2)
+### Step 4: Low-Precision Vector Pipeline (`fp16` / `int8`) *(Completed)*
+* **Objective**: Halve (or quarter) memory bandwidth in the ring buffer and shortlist reranker while preserving ranking quality.
+* **Changes**:
+  1. **`fp16` (`[f16; 768]`, 1,536 B/vec)** + `dot_f16_768` (`src/lowprec.rs`, `src/embed.rs`); optional ring mirrors on `PendingVector`.
+  2. **Symmetric per-vector `int8` (`[i8; 768]` + `f16` scale, 770 B/vec)** + `dot_i8_768`.
+  3. CLI `bench-precision-rerank` compares fp32/fp16/int8 on the same shortlist.
+* **Measured Impact** (with `w_s4=0.20`):
+
+  | Config | fp32 R@10 | fp16 parity | int8 parity | B/vec |
+  |--------|----------:|------------:|------------:|------:|
+  | 1M / sl256 | 0.881 | **100.0%** | 99.05% | 3072 / 1536 / 770 |
+  | 1M / sl1024 | 0.954 | **100.0%** | 98.55% | |
+  | 8.8M / sl256 | 0.899 | **100.0%** | 98.60% | |
+  | 8.8M / sl1024 | 0.963 | **100.0%** | 98.01% | |
+
+  fp16 is the production default for bandwidth; int8 is usable when ~98–99% ANN parity is acceptable (qrels nDCG nearly unchanged). See `bench_results/step4/RESULTS.md`.
+
+---
+
+### Step 5: Storage-Level Token & Page Fusion (`passages.bin` v2) *(Completed)*
 * **Objective**: Eliminate BPE/SentencePiece tokenization from the query rerank path and enable zero-copy GPU buffer mapping.
 * **Changes**:
-  1. **Pre-Tokenized `u16` Token IDs in `passages.bin`**:
-     * Since every ingested passage is already tokenized once to compute its embedding during `ingest()`, persist its `u16` token IDs (`token_len: u16` + `[u16; token_len]`) alongside the raw text in `passages.bin`.
-     * During `rerank_batch` ($K_{\text{cand}} = 64\text{–}128$), fetch **only the compact `u16` token slices** (`~128–512 B` per candidate) and feed them directly into the embedding model — skipping tokenization completely on the query path. Raw UTF-8 text is fetched **only for the final `top_k = 10` hits**!
-  2. **16 KiB Page Alignment (`align(16384)`)**:
-     * Align segment slabs and token slabs to Apple Silicon's `16,384`-byte VM page size (`4 × PaxBlock64` = 16 KiB) so `mmap` regions can be bound directly to Metal via `makeBuffer(bytesNoCopy:)` with `.storageModeShared`.
+  1. **Pre-Tokenized `u16` Token IDs in `passages.bin`** (`src/passage.rs`):
+     * Persist `token_len: u16` + `[u16; token_len]` alongside UTF-8 text; index entries carry `token_offset` / `token_len`.
+     * `fetch_tokens_many(&[u64])` reads compact token spans for shortlist rerank; raw UTF-8 via `fetch_many` only for final `top_k`.
+  2. **16 KiB Page Alignment** (`align` / `align_page(16384)` / `PassageStore::pad_to_page`).
+  3. Unit + e2e coverage in `tests/e2e.rs`.
 
 ---
+
 
 ### Step 6: Operator-Level & Custom Kernel Fusion (Apple Silicon Metal / MLX / ANE)
 * **Objective**: Fuse the local `EmbeddingGemma` model directly into the `PaxBlock64` encoder and shortlist reranker using custom Apple Silicon kernels.

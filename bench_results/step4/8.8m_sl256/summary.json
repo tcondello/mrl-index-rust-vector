@@ -1,0 +1,50 @@
+[
+  {
+    "bytes_per_vec": 3072,
+    "corpus": "BeIR/msmarco / data/msmarco_gemma2/full_bin",
+    "encode_ms": 52044.817553,
+    "label": "8.8m_sl256-fp32",
+    "mean_rerank_us": 9051.902051719202,
+    "mean_scan_ms": 234.95080192320938,
+    "n_queries": 6980,
+    "n_vectors": 8841823,
+    "precision": "fp32",
+    "qrels_ndcg_at_10": 0.33193565159513383,
+    "qrels_recall_at_10": 0.5283906399235914,
+    "recall_parity_vs_fp32": 1.0,
+    "reranked_recall_at_10": 0.8987535816618819,
+    "shortlist": 256
+  },
+  {
+    "bytes_per_vec": 1536,
+    "corpus": "BeIR/msmarco / data/msmarco_gemma2/full_bin",
+    "encode_ms": 52044.817553,
+    "label": "8.8m_sl256-fp16",
+    "mean_rerank_us": 645.9919458452724,
+    "mean_scan_ms": 234.95080192320938,
+    "n_queries": 6980,
+    "n_vectors": 8841823,
+    "precision": "fp16",
+    "qrels_ndcg_at_10": 0.33193565159513383,
+    "qrels_recall_at_10": 0.5283906399235914,
+    "recall_parity_vs_fp32": 1.0,
+    "reranked_recall_at_10": 0.8987535816618819,
+    "shortlist": 256
+  },
+  {
+    "bytes_per_vec": 770,
+    "corpus": "BeIR/msmarco / data/msmarco_gemma2/full_bin",
+    "encode_ms": 52044.817553,
+    "label": "8.8m_sl256-int8",
+    "mean_rerank_us": 617.4819222063039,
+    "mean_scan_ms": 234.95080192320938,
+    "n_queries": 6980,
+    "n_vectors": 8841823,
+    "precision": "int8",
+    "qrels_ndcg_at_10": 0.33139317766764265,
+    "qrels_recall_at_10": 0.52865329512894,
+    "recall_parity_vs_fp32": 0.9859882358567186,
+    "reranked_recall_at_10": 0.8861604584527062,
+    "shortlist": 256
+  }
+]

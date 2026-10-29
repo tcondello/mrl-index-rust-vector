@@ -36,7 +36,8 @@ pub struct EngineConfig {
     // Axis 2 — Pruning & Recall
     pub shortlist_cand: usize,
     pub cs_tolerance: f32,
-    /// Query-side Stratum-4 MMSE shrinkage weight (`1/√B` default for Gemma@768).
+    /// Query-side Stratum-4 shrinkage weight (default `0.20` from Stage 2 sweep;
+    /// pure MMSE `1/√B ≈ 0.333` is available via `mmse_stratum4_weight`).
     /// Encoded `PaxBlock64` bits are invariant to positive fold scaling, so this
     /// can be swept without re-encoding.
     pub stratum4_weight: f32,
