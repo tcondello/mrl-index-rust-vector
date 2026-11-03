@@ -24,7 +24,7 @@ enum Cmd {
         dir: PathBuf,
         #[arg(long)]
         dims: Option<usize>,
-        #[arg(long, default_value = "l1_rabitq")]
+        #[arg(long, default_value = "full_64b")]
         strata: String,
         #[arg(long, default_value_t = 64)]
         shortlist: usize,
@@ -118,7 +118,7 @@ enum Cmd {
         /// 256–1024 is the quality operating range (see bench_results/ablation/).
         #[arg(long, default_value_t = 256)]
         shortlist: usize,
-        #[arg(long, default_value = "l1_rabitq")]
+        #[arg(long, default_value = "full_64b")]
         strata: String,
         /// Query-side Stratum-4 MMSE weight (default 1/√9 ≈ 0.3333).
         #[arg(long, default_value_t = mrl_index::rotate::DEFAULT_STRATUM4_WEIGHT)]
@@ -126,6 +126,9 @@ enum Cmd {
         /// Cauchy–Schwarz early-reject tolerance.
         #[arg(long, default_value_t = 1.0)]
         cs_tolerance: f32,
+        /// Print CS prune keep-rates (forces serial scan).
+        #[arg(long, default_value_t = false)]
+        scan_stats: bool,
     },
     /// Compare fp32 / fp16 / int8 shortlist rerank parity (Step 4).
     BenchPrecisionRerank {
@@ -139,7 +142,7 @@ enum Cmd {
         queries: Option<usize>,
         #[arg(long, default_value_t = 256)]
         shortlist: usize,
-        #[arg(long, default_value = "l1_rabitq")]
+        #[arg(long, default_value = "full_64b")]
         strata: String,
     },
     /// Encode PaxBlocks once; sweep query-side `stratum4_weight` × `cs_tolerance` × shortlist.
@@ -152,7 +155,7 @@ enum Cmd {
         data: PathBuf,
         #[arg(long)]
         queries: Option<usize>,
-        #[arg(long, default_value = "l1_rabitq")]
+        #[arg(long, default_value = "full_64b")]
         strata: String,
         /// Comma-separated shortlists, e.g. `256` or `256,512`.
         #[arg(long, default_value = "256")]
@@ -339,7 +342,7 @@ fn main() -> Result<()> {
                     32,
                     384,
                     64,
-                    StrataDepth::L1Rabitq,
+                    StrataDepth::Full64b,
                     42,
                 );
                 let ingest = mrl_index::benchmark::run_ingest_bench(&label, 4_096, 384);
@@ -374,6 +377,7 @@ fn main() -> Result<()> {
             strata,
             stratum4_weight,
             cs_tolerance,
+            scan_stats,
         } => {
             let strata = parse_strata(&strata)?;
             let params = mrl_index::retrieval_bench::RetrievalBenchParams {
@@ -381,6 +385,7 @@ fn main() -> Result<()> {
                 strata,
                 stratum4_weight,
                 cs_tolerance,
+                collect_scan_stats: scan_stats,
             };
             let report = mrl_index::retrieval_bench::run_retrieval_bench_params(
                 &label,

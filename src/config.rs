@@ -2,17 +2,45 @@
 
 use serde::{Deserialize, Serialize};
 
-/// How many bitplane strata are materialised / scanned.
+use crate::geometry::SketchGeometry;
+
+/// How many bitplane strata are evaluated during scan ranking.
+///
+/// Encode always packs the full `PaxBlock64`; this enum only gates which
+/// score / prune stages run at query time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StrataDepth {
-    /// Sign plane only (~16 B/vec effective hot path).
+    /// Sign plane only (MSB of the 4-bit MRL prefix) + loose residual CS.
     L0Only,
-    /// Sign + RaBitQ 1-bit plane (default balanced).
-    #[default]
+    /// 4-bit MRL prefix + RaBitQ mid-band (+ post-S1 CS). Skips folded S4.
     L1Rabitq,
-    /// Full 64 B/vec PaxBlock64 strata.
+    /// Full production sketch: prefix + RaBitQ + folded S4 (+ S4 abs-budget prune).
+    ///
+    /// Default for Gemma@768 quality (matches the historical `l1_rabitq` bench
+    /// path, which already scored S4 despite the name).
+    #[default]
     Full64b,
+}
+
+impl StrataDepth {
+    /// Whether the 4-bit MRL prefix (strata 0/2/3/5) is scored.
+    #[inline]
+    pub fn includes_prefix_4bit(self) -> bool {
+        !matches!(self, Self::L0Only)
+    }
+
+    /// Whether RaBitQ mid-band IP + post-S1 CS run.
+    #[inline]
+    pub fn includes_rabitq(self) -> bool {
+        matches!(self, Self::L1Rabitq | Self::Full64b)
+    }
+
+    /// Whether folded-tail S4 abs-budget prune + S4 IP run.
+    #[inline]
+    pub fn includes_tail_fold(self) -> bool {
+        matches!(self, Self::Full64b)
+    }
 }
 
 /// Page-cache / DRAM residency strategy for segment slabs.
@@ -23,6 +51,49 @@ pub enum SlabResidency {
     #[default]
     MmapWillneed,
     DirectNvme,
+}
+
+/// Scan-time policy knobs (subset of [`EngineConfig`] consumed by the scan kernel).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ScanConfig {
+    pub shortlist_cand: usize,
+    pub cs_tolerance: f32,
+    pub stratum4_weight: f32,
+    pub strata_depth: StrataDepth,
+    pub temporal_filter_enable: bool,
+    pub numa_sharding: bool,
+}
+
+impl ScanConfig {
+    pub fn from_engine(cfg: &EngineConfig) -> Self {
+        Self {
+            shortlist_cand: cfg.shortlist_cand,
+            cs_tolerance: cfg.cs_tolerance,
+            stratum4_weight: cfg.stratum4_weight,
+            strata_depth: cfg.strata_depth,
+            temporal_filter_enable: cfg.temporal_filter_enable,
+            numa_sharding: cfg.numa_sharding,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(16..=4096).contains(&self.shortlist_cand) {
+            return Err("shortlist_cand must be in [16, 4096]".into());
+        }
+        if !(0.80..=1.20).contains(&self.cs_tolerance) {
+            return Err("cs_tolerance must be in [0.80, 1.20]".into());
+        }
+        if !(0.05..=1.50).contains(&self.stratum4_weight) {
+            return Err("stratum4_weight must be in [0.05, 1.50]".into());
+        }
+        Ok(())
+    }
+}
+
+impl From<&EngineConfig> for ScanConfig {
+    fn from(cfg: &EngineConfig) -> Self {
+        Self::from_engine(cfg)
+    }
 }
 
 /// Full engine configuration across the four tuning axes.
@@ -65,7 +136,9 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            strata_depth: StrataDepth::L1Rabitq,
+            // Full64b matches the historical production path (S4 scored under the
+            // old `l1_rabitq` label). L1Rabitq is now the true S1-without-S4 ablation.
+            strata_depth: StrataDepth::Full64b,
             slab_residency: SlabResidency::MmapWillneed,
             numa_sharding: true,
             shortlist_cand: 64,
@@ -88,20 +161,8 @@ impl Default for EngineConfig {
 
 impl EngineConfig {
     pub fn validate(&self) -> Result<(), String> {
-        // Upper bound raised for large-corpus MRL (EmbeddingGemma @768): shortlist
-        // 64–256 leaves substantial exact@10 on the table; 512–1024 recovers most of it.
-        if !(16..=4096).contains(&self.shortlist_cand) {
-            return Err("shortlist_cand must be in [16, 4096]".into());
-        }
-        if !(0.80..=1.20).contains(&self.cs_tolerance) {
-            return Err("cs_tolerance must be in [0.80, 1.20]".into());
-        }
-        if !(0.05..=1.50).contains(&self.stratum4_weight) {
-            return Err("stratum4_weight must be in [0.05, 1.50]".into());
-        }
-        if self.embed_dims < 192 {
-            return Err("embed_dims must be >= 192 (prefix 64 + mid 128)".into());
-        }
+        ScanConfig::from_engine(self).validate()?;
+        self.geometry().validate()?;
         if self.use_gemma2 && self.embed_dims != 768 {
             return Err("use_gemma2 (--gemma2) requires embed_dims == 768".into());
         }
@@ -114,11 +175,25 @@ impl EngineConfig {
         Ok(())
     }
 
-    /// Strata actually evaluated during a scan given depth setting.
+    /// Sketch geometry implied by `embed_dims` / `mrl_prefix`.
+    pub fn geometry(&self) -> SketchGeometry {
+        let mut g = SketchGeometry::for_embed_dims(self.embed_dims);
+        g.mrl_prefix = self.mrl_prefix;
+        g
+    }
+
+    /// Scan-kernel view of this config.
+    pub fn scan_config(&self) -> ScanConfig {
+        ScanConfig::from_engine(self)
+    }
+
+    /// Strata ids touched by the scan kernel for this depth.
+    ///
+    /// `0/2/3/5` = 4-bit prefix planes, `1` = RaBitQ, `4` = folded tail.
     pub fn active_strata(&self) -> &'static [u8] {
         match self.strata_depth {
             StrataDepth::L0Only => &[0],
-            StrataDepth::L1Rabitq => &[0, 1],
+            StrataDepth::L1Rabitq => &[0, 1, 2, 3, 5],
             StrataDepth::Full64b => &[0, 1, 2, 3, 4, 5],
         }
     }

@@ -15,12 +15,12 @@ use std::time::Instant;
 use memmap2::{Advice, Mmap, MmapOptions};
 use serde::{Deserialize, Serialize};
 
-use crate::block::{source, PaxBlock64, VECTORS_PER_BLOCK};
+use crate::block::{source, PaxBlock64};
 use crate::config::{EngineConfig, StrataDepth};
 use crate::corpus::CorpusError;
-use crate::embed::dot;
-use crate::quantize::encode_block;
-use crate::scan::{scan_blocks, QueryPlan, ScoredHit};
+use crate::encoder::{encode_f32_corpus_par, QuantizeEncoder};
+use crate::pipeline::{scored_hits_to_row_ids, QueryPipeline};
+use crate::scan::ScoredHit;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RetrievalManifest {
@@ -257,31 +257,12 @@ fn read_f32_matrix(path: &Path, rows: usize, dims: usize) -> Result<Vec<f32>, Co
 }
 
 fn encode_corpus_mmap(emb: &MmapF32Matrix) -> Vec<PaxBlock64> {
-    use rayon::prelude::*;
-
-    let n = emb.rows();
-    let dims = emb.dims();
-    let slice = emb.as_slice();
-    let n_blocks = n.div_ceil(VECTORS_PER_BLOCK);
-    (0..n_blocks)
-        .into_par_iter()
-        .map(|bi| {
-            let start = bi * VECTORS_PER_BLOCK;
-            let end = (start + VECTORS_PER_BLOCK).min(n);
-            let refs: Vec<&[f32]> = (start..end)
-                .map(|j| &slice[j * dims..(j + 1) * dims])
-                .collect();
-            let ts: Vec<u32> = (start..end).map(|j| j as u32).collect();
-            let src = vec![source::DOC; end - start];
-            encode_block(&refs, &ts, &src, dims)
-        })
-        .collect()
+    let enc = QuantizeEncoder::new(emb.dims());
+    encode_f32_corpus_par(&enc, emb.as_slice(), emb.rows(), source::DOC)
 }
 
 fn hit_ids(hits: &[ScoredHit]) -> Vec<usize> {
-    hits.iter()
-        .map(|h| h.id.block as usize * VECTORS_PER_BLOCK + h.id.slot as usize)
-        .collect()
+    scored_hits_to_row_ids(hits)
 }
 
 fn recall_at_k(truth: &HashSet<usize>, pred: &[usize], k: usize) -> f64 {
@@ -347,15 +328,19 @@ pub struct RetrievalBenchParams {
     pub strata: StrataDepth,
     pub stratum4_weight: f32,
     pub cs_tolerance: f32,
+    /// When true, accumulate CS prune counters (forces serial scan).
+    pub collect_scan_stats: bool,
 }
 
 impl Default for RetrievalBenchParams {
     fn default() -> Self {
         Self {
             shortlist: 256,
-            strata: StrataDepth::L1Rabitq,
+            // Full64b = historical production path (S4 on); was mislabeled l1_rabitq.
+            strata: StrataDepth::Full64b,
             stratum4_weight: crate::rotate::DEFAULT_STRATUM4_WEIGHT,
             cs_tolerance: 1.0,
+            collect_scan_stats: false,
         }
     }
 }
@@ -465,6 +450,7 @@ pub fn run_retrieval_sweep(
                     strata,
                     stratum4_weight: w,
                     cs_tolerance: cs,
+                    collect_scan_stats: false,
                 };
                 let report = eval_retrieval_on_blocks(
                     &label, &data, &blocks, n_queries, params, encode_ms,
@@ -509,28 +495,29 @@ fn eval_retrieval_on_blocks(
     let mut qrels_ndcg = 0.0;
     let mut qrels_n = 0usize;
     let mut scan_ms_sum = 0.0;
+    let mut scan_stats = crate::scan::ScanStats::default();
+    let pipe = QueryPipeline::new(&cfg);
 
     let progress_every = (n_queries / 20).max(1);
     for qi in 0..n_queries {
         let q = data.query_vector(qi);
         let truth10: HashSet<usize> = data.neighbors[qi].iter().take(10).copied().collect();
         let truth100: HashSet<usize> = data.neighbors[qi].iter().take(100).copied().collect();
-        let plan = QueryPlan::from_query(q, dims);
 
-        let t = Instant::now();
-        let hits = scan_blocks(blocks, &plan, &cfg, None, None);
-        scan_ms_sum += t.elapsed().as_secs_f64() * 1000.0;
-        let ids = hit_ids(&hits);
+        let phase = pipe.scan_slab(
+            q,
+            blocks,
+            None,
+            None,
+            params.collect_scan_stats.then_some(&mut scan_stats),
+        );
+        scan_ms_sum += phase.scan_ms;
+        let ids = hit_ids(&phase.hits);
 
         let covered = truth10.iter().filter(|i| ids.contains(i)).count() as f64 / 10.0;
         coverage10 += covered;
 
-        let mut reranked: Vec<(usize, f32)> = ids
-            .iter()
-            .copied()
-            .map(|i| (i, dot(q, data.corpus_vector(i))))
-            .collect();
-        reranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let reranked = QueryPipeline::rerank_exact_rows(q, &ids, |i| data.corpus_vector(i));
         let rerank_ids: Vec<usize> = reranked.into_iter().map(|(i, _)| i).collect();
 
         rerank10 += recall_at_k(&truth10, &rerank_ids, 10);
@@ -555,6 +542,10 @@ fn eval_retrieval_on_blocks(
     let mean_scan_ms = scan_ms_sum / n_queries as f64;
     let mvecs = (n as f64 / (mean_scan_ms / 1000.0)) / 1e6;
     let qrels_denom = qrels_n.max(1) as f64;
+
+    if params.collect_scan_stats {
+        scan_stats.print_summary();
+    }
 
     RetrievalBenchReport {
         label: label.into(),
@@ -681,16 +672,15 @@ pub fn run_precision_rerank_bench(
     let mut rerank_us = [0.0f64; 3];
     let mut scan_ms_sum = 0.0;
 
+    let pipe = QueryPipeline::new(&cfg);
     let progress_every = (n_queries / 20).max(1);
     for qi in 0..n_queries {
         let q = data.query_vector(qi);
         let truth10: HashSet<usize> = data.neighbors[qi].iter().take(10).copied().collect();
-        let plan = QueryPlan::from_query(q, dims);
 
-        let t = Instant::now();
-        let hits = scan_blocks(&blocks, &plan, &cfg, None, None);
-        scan_ms_sum += t.elapsed().as_secs_f64() * 1000.0;
-        let ids = hit_ids(&hits);
+        let phase = pipe.scan_slab(q, &blocks, None, None, None);
+        scan_ms_sum += phase.scan_ms;
+        let ids = hit_ids(&phase.hits);
 
         for (pi, &prec) in precisions.iter().enumerate() {
             let t_r = Instant::now();

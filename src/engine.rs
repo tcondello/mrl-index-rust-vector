@@ -11,9 +11,11 @@ use crate::config::EngineConfig;
 use crate::embed::HashingEmbedder;
 use crate::gemma_embed::Gemma2Embedder;
 use crate::passage::{PassageRecord, PassageStore};
+use crate::encoder::FusedPackedEncoder;
+use crate::pipeline::QueryPipeline;
 use crate::rerank::{rerank_with_query_vec, Embedder, PackedTokenBatch, RerankHit, UnifiedEmbedder};
 use crate::ring::{PendingVector, RingBuffer};
-use crate::scan::{scan_block, scan_blocks, QueryPlan, Shortlist};
+use crate::scan::Shortlist;
 use crate::segment::{SegmentReader, SegmentWriter};
 
 #[derive(Debug, thiserror::Error)]
@@ -379,10 +381,11 @@ impl IndexEngine {
                 cu_seqlens: &cu_seqlens,
             };
             let mut out_blocks = vec![crate::block::PaxBlock64::zeroed(); 1];
+            // FusedPackedEncoder is implemented for UnifiedEmbedder.
             self.unified_embedder
                 .as_ref()
                 .expect("unified_embedder attached")
-                .ingest_packed_to_paxblocks(packed_view, &ts64, &src64, &mut out_blocks);
+                .encode_packed_blocks(packed_view, &ts64, &src64, &mut out_blocks);
 
             for block in out_blocks {
                 self.commit_block_inner(block, false)?;
@@ -508,30 +511,17 @@ impl IndexEngine {
         let query = &q_embed[0];
         let embed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
+        let pipe = QueryPipeline::new(&self.config);
         let t_scan = Instant::now();
-        let plan = QueryPlan::from_query(query, self.config.embed_dims);
+        let plan = pipe.build_plan(query);
         let mut shortlist = Shortlist::new(self.config.shortlist_cand);
-        let n_blocks = self.segment_reader.block_count();
-
-        if let Some(blocks) = self.segment_reader.as_slice() {
-            for hit in scan_blocks(blocks, &plan, &self.config, time_lo, time_hi) {
-                shortlist.push(hit);
-            }
-        } else {
-            for i in 0..n_blocks {
-                if let Some(block) = self.segment_reader.block(i) {
-                    scan_block(
-                        block,
-                        i as u32,
-                        &plan,
-                        &self.config,
-                        &mut shortlist,
-                        time_lo,
-                        time_hi,
-                    );
-                }
-            }
-        }
+        let n_blocks = pipe.scan_segments_into(
+            &plan,
+            &self.segment_reader,
+            &mut shortlist,
+            time_lo,
+            time_hi,
+        );
 
         // Merge exact ring hits (0 ms index latency path).
         {
@@ -636,30 +626,17 @@ impl IndexEngine {
         let query = &session.query_f32;
         let embed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
+        let pipe = QueryPipeline::new(&self.config);
         let t_scan = Instant::now();
-        let plan = QueryPlan::from_query(query, self.config.embed_dims);
+        let plan = pipe.build_plan(query);
         let mut shortlist = Shortlist::new(self.config.shortlist_cand);
-        let n_blocks = self.segment_reader.block_count();
-
-        if let Some(blocks) = self.segment_reader.as_slice() {
-            for hit in scan_blocks(blocks, &plan, &self.config, time_lo, time_hi) {
-                shortlist.push(hit);
-            }
-        } else {
-            for i in 0..n_blocks {
-                if let Some(block) = self.segment_reader.block(i) {
-                    scan_block(
-                        block,
-                        i as u32,
-                        &plan,
-                        &self.config,
-                        &mut shortlist,
-                        time_lo,
-                        time_hi,
-                    );
-                }
-            }
-        }
+        let n_blocks = pipe.scan_segments_into(
+            &plan,
+            &self.segment_reader,
+            &mut shortlist,
+            time_lo,
+            time_hi,
+        );
 
         // Merge exact ring hits (0 ms index latency path).
         {

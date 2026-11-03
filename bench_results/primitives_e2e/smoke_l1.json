@@ -1,0 +1,23 @@
+{
+  "label": "primitives-smoke-l1ablate",
+  "corpus": "BeIR/msmarco / data/msmarco_gemma2/smoke_bin",
+  "model": "google/embeddinggemma-2",
+  "scale": "smoke",
+  "mrl": true,
+  "n_vectors": 8192,
+  "n_queries": 128,
+  "dims": 768,
+  "shortlist": 256,
+  "strata": "l1_rabitq",
+  "corpus_mmap": true,
+  "stratum4_weight": 0.2,
+  "cs_tolerance": 1.0,
+  "shortlist_coverage_at_10": 0.8882812500000005,
+  "reranked_recall_at_10": 0.8882812500000005,
+  "reranked_recall_at_100": 0.5698437499999998,
+  "qrels_recall_at_10": 0.984375,
+  "qrels_ndcg_at_10": 0.9529330496557518,
+  "mean_scan_ms": 0.8116951484374999,
+  "mvecs_per_sec": 10.092458992479466,
+  "encode_ms": 8.681227999999999
+}

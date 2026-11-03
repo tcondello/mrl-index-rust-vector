@@ -7,8 +7,8 @@ use half::f16;
 
 use crate::block::{source, PaxBlock64, VECTORS_PER_BLOCK};
 use crate::embed::dot;
+use crate::encoder::encode_pending_embeddings;
 use crate::lowprec::{Fp16Vec768, Int8Vec768, EMBED_DIMS_768};
-use crate::quantize::encode_block;
 
 #[derive(Debug, Clone)]
 pub struct PendingVector {
@@ -93,14 +93,13 @@ impl RingBuffer {
     fn flush_block(&mut self) -> PaxBlock64 {
         let take = self.pending.len().min(VECTORS_PER_BLOCK);
         let batch: Vec<PendingVector> = self.pending.drain(..take).collect();
-        let dims = batch[0].embedding.len();
         let refs: Vec<&[f32]> = batch.iter().map(|p| p.embedding.as_slice()).collect();
         let timestamps: Vec<u32> = batch.iter().map(|p| p.timestamp).collect();
         let sources: Vec<u32> = batch
             .iter()
             .map(|p| if p.source == 0 { source::DOC } else { p.source })
             .collect();
-        encode_block(&refs, &timestamps, &sources, dims)
+        encode_pending_embeddings(&refs, &timestamps, &sources)
     }
 
     /// Brute-force scan of unflushed embeddings (exact dots) for 0 ms build latency.

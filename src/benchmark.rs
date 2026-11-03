@@ -12,13 +12,14 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
 
-use crate::block::{source, PaxBlock64, VECTORS_PER_BLOCK};
+use crate::block::{source, PaxBlock64};
 use crate::config::{EngineConfig, SlabResidency, StrataDepth};
 use crate::corpus::MrlCorpus;
 use crate::embed::dot;
+use crate::encoder::{encode_f32_rows, QuantizeEncoder};
 use crate::engine::IndexEngine;
-use crate::quantize::encode_block;
-use crate::scan::{scan_blocks, QueryPlan, ScoredHit};
+use crate::pipeline::{scored_hits_to_row_ids, QueryPipeline};
+use crate::scan::ScoredHit;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanRecallReport {
@@ -74,14 +75,7 @@ fn l2_normalize(v: &mut [f32]) {
 }
 
 fn encode_corpus(vecs: &[Vec<f32>], dims: usize) -> Vec<PaxBlock64> {
-    let mut blocks = Vec::new();
-    for chunk in vecs.chunks(VECTORS_PER_BLOCK) {
-        let refs: Vec<&[f32]> = chunk.iter().map(|v| v.as_slice()).collect();
-        let ts: Vec<u32> = (0..chunk.len()).map(|i| i as u32).collect();
-        let src = vec![source::DOC; chunk.len()];
-        blocks.push(encode_block(&refs, &ts, &src, dims));
-    }
-    blocks
+    encode_f32_rows(&QuantizeEncoder::new(dims), vecs, source::DOC)
 }
 
 fn exact_topk(query: &[f32], corpus: &[Vec<f32>], k: usize) -> Vec<(usize, f32)> {
@@ -96,9 +90,7 @@ fn exact_topk(query: &[f32], corpus: &[Vec<f32>], k: usize) -> Vec<(usize, f32)>
 }
 
 fn hit_ids(hits: &[ScoredHit]) -> Vec<usize> {
-    hits.iter()
-        .map(|h| h.id.block as usize * VECTORS_PER_BLOCK + h.id.slot as usize)
-        .collect()
+    scored_hits_to_row_ids(hits)
 }
 
 fn recall_overlap(truth: &[(usize, f32)], pred_ids: &[usize], k: usize) -> f64 {
@@ -137,6 +129,7 @@ fn run_scan_on_vectors(
     let mut reranked10 = 0.0;
     let mut scan_ranked10 = 0.0;
     let mut scan_ms_sum = 0.0;
+    let pipe = QueryPipeline::new(&cfg);
 
     for &qi in query_indices {
         let q = &vectors[qi];
@@ -144,13 +137,11 @@ fn run_scan_on_vectors(
         let truth: Vec<(usize, f32)> = truth.into_iter().filter(|(i, _)| *i != qi).collect();
         let truth10: std::collections::HashSet<usize> =
             truth.iter().take(10).map(|(i, _)| *i).collect();
-        let plan = QueryPlan::from_query(q, dims);
 
-        let t = Instant::now();
-        let hits = scan_blocks(&blocks, &plan, &cfg, None, None);
-        scan_ms_sum += t.elapsed().as_secs_f64() * 1000.0;
+        let phase = pipe.scan_slab(q, &blocks, None, None, None);
+        scan_ms_sum += phase.scan_ms;
 
-        let ids: Vec<usize> = hit_ids(&hits).into_iter().filter(|i| *i != qi).collect();
+        let ids: Vec<usize> = hit_ids(&phase.hits).into_iter().filter(|i| *i != qi).collect();
 
         // Coverage: any order in shortlist.
         let covered = truth10.iter().filter(|i| ids.contains(i)).count() as f64 / 10.0;
@@ -160,11 +151,7 @@ fn run_scan_on_vectors(
         scan_ranked10 += recall_overlap(&truth, &ids, 10);
 
         // Design-faithful: exact-IP rerank of shortlist, then R@10.
-        let mut reranked: Vec<(usize, f32)> = ids
-            .iter()
-            .map(|&i| (i, dot(q, &vectors[i])))
-            .collect();
-        reranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let reranked = QueryPipeline::rerank_exact_rows(q, &ids, |i| vectors[i].as_slice());
         let rerank_ids: Vec<usize> = reranked.into_iter().map(|(i, _)| i).collect();
         reranked10 += recall_overlap(&truth, &rerank_ids, 10);
     }
@@ -264,7 +251,7 @@ pub fn run_ingest_bench(label: &str, n_docs: usize, dims: usize) -> IngestReport
     let mut cfg = EngineConfig::default();
     cfg.embed_dims = dims;
     cfg.slab_residency = SlabResidency::RamLocked;
-    cfg.strata_depth = StrataDepth::L1Rabitq;
+    cfg.strata_depth = StrataDepth::Full64b;
 
     let mut engine = IndexEngine::create(&dir, cfg).expect("create");
     let items: Vec<(String, u32, u32)> = (0..n_docs)
@@ -300,13 +287,13 @@ pub fn run_suite_mrl(
     label: &str,
     embeddings_dir: &Path,
 ) -> Result<BenchSuiteReport, crate::corpus::CorpusError> {
-    // L1_RABITQ now scores full 4-bit prefix + RaBitQ (planes always on disk).
+    // Full64b = production sketch (prefix + RaBitQ + folded S4).
     let scan = run_scan_recall_mrl(
         label,
         embeddings_dir,
         64,
         128, // larger shortlist → higher coverage before JIT rerank
-        StrataDepth::L1Rabitq,
+        StrataDepth::Full64b,
         42,
     )?;
     let ingest = run_ingest_bench(label, 4_096, scan.dims);

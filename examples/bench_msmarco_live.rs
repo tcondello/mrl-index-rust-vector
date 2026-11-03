@@ -529,7 +529,7 @@ fn main() {
         }
         let mut cfg = EngineConfig::default();
         cfg.embed_dims = 768;
-        cfg.strata_depth = StrataDepth::L1Rabitq;
+        cfg.strata_depth = StrataDepth::Full64b;
         cfg.shortlist_cand = sl;
         cfg.final_top_k = 10;
 
@@ -666,7 +666,7 @@ fn main() {
         batch_size: VECTORS_PER_BLOCK,
         ingest_batch_size: VECTORS_PER_BLOCK,
         query_batch_size: queries.len(),
-        strata: "l1_rabitq".into(),
+        strata: "full_64b".into(),
         stratum4_weight: default_cfg.stratum4_weight,
         cs_tolerance: default_cfg.cs_tolerance,
         rerank_mode: "in_memory_dot_768 (bench harness caches live-embedded [f32; 768] in RAM for fast multi-shortlist sweep; IndexEngine::query uses zero-f32-storage JIT re-embed over packed u32 token spans)".into(),

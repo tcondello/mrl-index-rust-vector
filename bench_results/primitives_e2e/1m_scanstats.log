@@ -1,0 +1,26 @@
+mmap corpus embeddings embeddings.bin (n=1000000 dims=768) …
+encode PaxBlocks n=1000000 dims=768 …
+encode done: 15625 blocks in 1.8 s
+  queries 1/16  mean_scan=98.6 ms/q  eta≈1s
+  queries 2/16  mean_scan=101.2 ms/q  eta≈1s
+  queries 3/16  mean_scan=102.0 ms/q  eta≈1s
+  queries 4/16  mean_scan=101.4 ms/q  eta≈1s
+  queries 5/16  mean_scan=101.4 ms/q  eta≈1s
+  queries 6/16  mean_scan=101.4 ms/q  eta≈1s
+  queries 7/16  mean_scan=101.1 ms/q  eta≈1s
+  queries 8/16  mean_scan=102.5 ms/q  eta≈1s
+  queries 9/16  mean_scan=101.9 ms/q  eta≈1s
+  queries 10/16  mean_scan=102.1 ms/q  eta≈1s
+  queries 11/16  mean_scan=102.0 ms/q  eta≈1s
+  queries 12/16  mean_scan=101.9 ms/q  eta≈0s
+  queries 13/16  mean_scan=101.7 ms/q  eta≈0s
+  queries 14/16  mean_scan=101.9 ms/q  eta≈0s
+  queries 15/16  mean_scan=101.6 ms/q  eta≈0s
+  queries 16/16  mean_scan=101.6 ms/q  eta≈0s
+scan-stats: blocks=250000 active=16000000  keep_prefix=100.00%  keep_s1=100.00%  keep_s4bud=7.09%  pushed=7.09%
+=== mrl-index retrieval bench [primitives-1m-scanstats] ===
+corpus: BeIR/msmarco / data/msmarco_gemma2/1m_bin  scale=1m  model=google/embeddinggemma-2  mrl=true  mmap=true
+scan: n=1000000 q=16 dims=768 shortlist=256 strata=full_64b
+ANN:  shortlist_cov@10=0.8938  reranked_R@10=0.8938  reranked_R@100=0.5512
+IR:   qrels_R@10=0.7500  qrels_nDCG@10=0.5208
+perf: encode=1835.4 ms  scan=101.557 ms/q  (9.85 Mvecs/s)
