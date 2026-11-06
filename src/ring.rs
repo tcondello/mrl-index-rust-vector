@@ -6,8 +6,9 @@
 use half::f16;
 
 use crate::block::{source, PaxBlock64, VECTORS_PER_BLOCK};
+use crate::eden::EdenFit;
 use crate::embed::dot;
-use crate::encoder::encode_pending_embeddings;
+use crate::encoder::encode_pending_embeddings_eden;
 use crate::lowprec::{Fp16Vec768, Int8Vec768, EMBED_DIMS_768};
 
 #[derive(Debug, Clone)]
@@ -72,25 +73,27 @@ impl RingBuffer {
     }
 
     /// Instant availability: vector is queryable from the hot ring before flush.
-    pub fn push(&mut self, item: PendingVector) -> Option<PaxBlock64> {
+    ///
+    /// When `eden` is `Some`, flushed PaxBlocks use EDEN-prod on the MRL prefix.
+    pub fn push(&mut self, item: PendingVector, eden: Option<&EdenFit>) -> Option<PaxBlock64> {
         self.pending.push(item);
         if self.pending.len() >= VECTORS_PER_BLOCK {
-            Some(self.flush_block())
+            Some(self.flush_block(eden))
         } else {
             None
         }
     }
 
     /// Force-flush a partial block (pads with tombstones).
-    pub fn flush_partial(&mut self) -> Option<PaxBlock64> {
+    pub fn flush_partial(&mut self, eden: Option<&EdenFit>) -> Option<PaxBlock64> {
         if self.pending.is_empty() {
             None
         } else {
-            Some(self.flush_block())
+            Some(self.flush_block(eden))
         }
     }
 
-    fn flush_block(&mut self) -> PaxBlock64 {
+    fn flush_block(&mut self, eden: Option<&EdenFit>) -> PaxBlock64 {
         let take = self.pending.len().min(VECTORS_PER_BLOCK);
         let batch: Vec<PendingVector> = self.pending.drain(..take).collect();
         let refs: Vec<&[f32]> = batch.iter().map(|p| p.embedding.as_slice()).collect();
@@ -99,7 +102,7 @@ impl RingBuffer {
             .iter()
             .map(|p| if p.source == 0 { source::DOC } else { p.source })
             .collect();
-        encode_pending_embeddings(&refs, &timestamps, &sources)
+        encode_pending_embeddings_eden(&refs, &timestamps, &sources, eden)
     }
 
     /// Brute-force scan of unflushed embeddings (exact dots) for 0 ms build latency.

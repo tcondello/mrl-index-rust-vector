@@ -98,12 +98,18 @@ pub fn structured_hadamard_inplace(v: &mut [f32], seed: u64) {
 }
 
 /// Fitted corpus mean over the coded slice (prefix by default).
-#[derive(Debug, Clone)]
+///
+/// Persisted beside the index as `eden_prefix.json` so encode and query share
+/// the same center. `n_observed` supports online mean updates during ingest.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EdenFit {
     pub dim: usize,
     pub bits: u8,
     pub seed: u64,
     pub mean: Vec<f32>,
+    /// How many vectors contributed to `mean` (0 ⇒ zero vector / unfitted).
+    #[serde(default)]
+    pub n_observed: u64,
 }
 
 impl EdenFit {
@@ -150,7 +156,49 @@ impl EdenFit {
             bits,
             seed,
             mean,
+            n_observed: n,
         }
+    }
+
+    /// Bootstrap fit with a zero mean (valid; improves as [`Self::observe_prefix`] runs).
+    pub fn zeros(dim: usize, bits: u8, seed: u64) -> Self {
+        assert!((1..=4).contains(&bits));
+        assert!(dim.is_power_of_two());
+        Self {
+            dim,
+            bits,
+            seed,
+            mean: vec![0.0f32; dim],
+            n_observed: 0,
+        }
+    }
+
+    /// Default production prefix fit (`d=64`, `b=4`, seed=`1`).
+    pub fn default_prefix(seed: u64) -> Self {
+        Self::zeros(crate::block::MRL_PREFIX_DIMS, 4, seed)
+    }
+
+    /// Online update of the prefix mean from one embedding row.
+    pub fn observe_prefix(&mut self, x: &[f32]) {
+        assert!(x.len() >= self.dim);
+        let n = self.n_observed.saturating_add(1);
+        let inv = 1.0 / n as f32;
+        for d in 0..self.dim {
+            // Welford-style running mean: m ← m + (x−m)/n
+            self.mean[d] += (x[d] - self.mean[d]) * inv;
+        }
+        self.n_observed = n;
+    }
+
+    pub fn save_json(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let s = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, s)
+    }
+
+    pub fn load_json(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let s = std::fs::read_to_string(path)?;
+        serde_json::from_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 }
 

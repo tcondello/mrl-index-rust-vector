@@ -7,16 +7,19 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::block::{source, VectorId, VECTORS_PER_BLOCK};
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, PrefixCodec};
+use crate::eden::EdenFit;
 use crate::embed::HashingEmbedder;
+use crate::encoder::FusedPackedEncoder;
 use crate::gemma_embed::Gemma2Embedder;
 use crate::passage::{PassageRecord, PassageStore};
-use crate::encoder::FusedPackedEncoder;
 use crate::pipeline::QueryPipeline;
 use crate::rerank::{rerank_with_query_vec, Embedder, PackedTokenBatch, RerankHit, UnifiedEmbedder};
 use crate::ring::{PendingVector, RingBuffer};
 use crate::scan::Shortlist;
 use crate::segment::{SegmentReader, SegmentWriter};
+
+const EDEN_PREFIX_FILE: &str = "eden_prefix.json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -68,6 +71,8 @@ pub struct IndexEngine {
     id_map: Mutex<Vec<u64>>,
     embedder: Box<dyn Embedder>,
     unified_embedder: Option<Box<dyn UnifiedEmbedder>>,
+    /// Shared EDEN-prod prefix fit (persisted as `eden_prefix.json`).
+    eden_fit: Mutex<Option<EdenFit>>,
 }
 
 impl IndexEngine {
@@ -85,6 +90,11 @@ impl IndexEngine {
         let ring = RingBuffer::new(config.ring_buffer_size);
         let embedder = Box::new(HashingEmbedder::new(config.embed_dims));
 
+        let eden_fit = if config.prefix_codec == PrefixCodec::EdenProd {
+            Some(EdenFit::default_prefix(config.eden_seed))
+        } else {
+            None
+        };
         let engine = Self {
             dir: dir.clone(),
             config: config.clone(),
@@ -95,8 +105,10 @@ impl IndexEngine {
             id_map: Mutex::new(Vec::new()),
             embedder,
             unified_embedder: None,
+            eden_fit: Mutex::new(eden_fit),
         };
         engine.write_manifest(0)?;
+        engine.write_eden_fit()?;
         Ok(engine)
     }
 
@@ -156,6 +168,17 @@ impl IndexEngine {
             )));
         }
 
+        let eden_path = dir.join(EDEN_PREFIX_FILE);
+        let eden_fit = if config.prefix_codec == PrefixCodec::EdenProd {
+            Some(if eden_path.exists() {
+                EdenFit::load_json(&eden_path)?
+            } else {
+                EdenFit::default_prefix(config.eden_seed)
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             dir,
             config,
@@ -166,11 +189,20 @@ impl IndexEngine {
             id_map: Mutex::new(id_map),
             embedder,
             unified_embedder: None,
+            eden_fit: Mutex::new(eden_fit),
         })
     }
 
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    fn write_eden_fit(&self) -> Result<(), EngineError> {
+        let guard = self.eden_fit.lock();
+        if let Some(fit) = guard.as_ref() {
+            fit.save_json(self.dir.join(EDEN_PREFIX_FILE))?;
+        }
+        Ok(())
     }
 
     pub fn dir(&self) -> &Path {
@@ -247,8 +279,12 @@ impl IndexEngine {
         let pending = PendingVector::new(id, embedding, timestamp, src, text);
 
         let maybe_block = {
+            let mut fit = self.eden_fit.lock();
+            if let Some(f) = fit.as_mut() {
+                f.observe_prefix(&pending.embedding);
+            }
             let mut ring = self.ring.lock();
-            ring.push(pending)
+            ring.push(pending, fit.as_ref())
         };
 
         if let Some(block) = maybe_block {
@@ -293,8 +329,12 @@ impl IndexEngine {
 
                 let pending = PendingVector::new(id, embedding, *ts, src, text.clone());
                 let maybe_block = {
+                    let mut fit = self.eden_fit.lock();
+                    if let Some(f) = fit.as_mut() {
+                        f.observe_prefix(&pending.embedding);
+                    }
                     let mut ring = self.ring.lock();
-                    ring.push(pending)
+                    ring.push(pending, fit.as_ref())
                 };
                 if let Some(block) = maybe_block {
                     self.commit_block_inner(block, false)?;
@@ -307,6 +347,7 @@ impl IndexEngine {
             self.passages.flush()?;
             let blocks_written = self.segment_writer.lock().block_count();
             self.write_manifest(blocks_written)?;
+            self.write_eden_fit()?;
         }
         Ok(ids)
     }
@@ -328,8 +369,9 @@ impl IndexEngine {
         let ring_is_empty = self.ring.lock().pending.is_empty();
         if !ring_is_empty {
             let b = {
+                let fit = self.eden_fit.lock();
                 let mut ring = self.ring.lock();
-                ring.flush_partial()
+                ring.flush_partial(fit.as_ref())
             };
             if let Some(block) = b {
                 self.commit_block_inner(block, false)?;
@@ -423,8 +465,12 @@ impl IndexEngine {
                 ids.push(id);
                 let pending = PendingVector::new(id, embedding, *ts, src, text.clone());
                 let maybe_block = {
+                    let mut fit = self.eden_fit.lock();
+                    if let Some(f) = fit.as_mut() {
+                        f.observe_prefix(&pending.embedding);
+                    }
                     let mut ring = self.ring.lock();
-                    ring.push(pending)
+                    ring.push(pending, fit.as_ref())
                 };
                 if let Some(block) = maybe_block {
                     self.commit_block_inner(block, false)?;
@@ -437,6 +483,7 @@ impl IndexEngine {
             self.passages.flush()?;
             let blocks_written = self.segment_writer.lock().block_count();
             self.write_manifest(blocks_written)?;
+            self.write_eden_fit()?;
         }
         Ok(ids)
     }
@@ -472,6 +519,7 @@ impl IndexEngine {
         if sync_metadata {
             self.passages.flush()?;
             self.write_manifest(blocks_written)?;
+            self.write_eden_fit()?;
         }
         Ok(())
     }
@@ -479,8 +527,9 @@ impl IndexEngine {
     /// Flush any partial ring contents into a tombstone-padded block.
     pub fn flush(&mut self) -> Result<(), EngineError> {
         let block = {
+            let fit = self.eden_fit.lock();
             let mut ring = self.ring.lock();
-            ring.flush_partial()
+            ring.flush_partial(fit.as_ref())
         };
         if let Some(block) = block {
             self.commit_block_inner(block, true)?;
@@ -488,6 +537,7 @@ impl IndexEngine {
             self.passages.flush()?;
             let blocks_written = self.segment_writer.lock().block_count();
             self.write_manifest(blocks_written)?;
+            self.write_eden_fit()?;
         }
         Ok(())
     }
@@ -511,7 +561,13 @@ impl IndexEngine {
         let query = &q_embed[0];
         let embed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-        let pipe = QueryPipeline::new(&self.config);
+        let eden_guard = self.eden_fit.lock();
+        let pipe = match eden_guard.as_ref() {
+            Some(fit) if self.config.prefix_codec == PrefixCodec::EdenProd => {
+                QueryPipeline::with_eden(&self.config, fit)
+            }
+            _ => QueryPipeline::new(&self.config),
+        };
         let t_scan = Instant::now();
         let plan = pipe.build_plan(query);
         let mut shortlist = Shortlist::new(self.config.shortlist_cand);
@@ -522,6 +578,7 @@ impl IndexEngine {
             time_lo,
             time_hi,
         );
+        drop(eden_guard);
 
         // Merge exact ring hits (0 ms index latency path).
         {
@@ -626,7 +683,13 @@ impl IndexEngine {
         let query = &session.query_f32;
         let embed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-        let pipe = QueryPipeline::new(&self.config);
+        let eden_guard = self.eden_fit.lock();
+        let pipe = match eden_guard.as_ref() {
+            Some(fit) if self.config.prefix_codec == PrefixCodec::EdenProd => {
+                QueryPipeline::with_eden(&self.config, fit)
+            }
+            _ => QueryPipeline::new(&self.config),
+        };
         let t_scan = Instant::now();
         let plan = pipe.build_plan(query);
         let mut shortlist = Shortlist::new(self.config.shortlist_cand);
@@ -637,6 +700,7 @@ impl IndexEngine {
             time_lo,
             time_hi,
         );
+        drop(eden_guard);
 
         // Merge exact ring hits (0 ms index latency path).
         {

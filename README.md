@@ -1,17 +1,25 @@
 # mrl-index
 
-Local-first **bitplane-transposed** vector retrieval engine (spec v3.5).
+Local-first **bitplane-transposed** vector retrieval for [Matryoshka](https://arxiv.org/abs/2205.13147) embeddings.
 
-Designed for personal workstations: keep a compact in-memory / NVMe scan index (16–64 bytes per vector), store **zero** full-precision L2 embeddings on disk, and rerank a short candidate list with one batched local embedding pass over raw text.
+Keep a compact in-memory / NVMe scan index (~**64 B/vector**), store **zero** full-precision L2 embeddings on disk, and rerank a short candidate list with one batched local embedding pass over raw text.
+
+**License:** MIT (`LICENSE`)
+
+## Idea
+
+MRL models put most of the useful signal in the first dimensions. We spend more bits on the head of the vector and fewer on the noisy tail. At query time we score the head first; if a document already cannot finish in the shortlist—even if the remaining bits were as good as possible—we skip reading the rest of its code.
+
+Default prefix codebook is **EDEN-prod** (4-bit Lloyd–Max after center / normalize / structured Hadamard). Mid-band stays 1-bit RaBitQ; the high-dim tail is a folded 1-bit sketch. See [`docs/OVERVIEW.md`](docs/OVERVIEW.md).
 
 ## Pipeline
 
 ```
-Query ─► embed ─► PaxBlock64 bitplane scan (XOR/POPCNT-style) ─► top K_cand
+Query ─► embed ─► PaxBlock64 bitplane scan ─► top K_cand
               ─► passages.idx O(1) text fetch ─► 1× batched embed rerank ─► top-K
 ```
 
-Ingest goes through an append-only ring buffer (queryable immediately) and flushes every 64 vectors into a 4 KiB page-aligned `PaxBlock64` macro-block.
+Ingest goes through an append-only ring buffer (queryable immediately) and flushes every 64 vectors into a 4 KiB page-aligned `PaxBlock64` macro-block. Fitted EDEN means live in `eden_prefix.json` next to `manifest.json`.
 
 ## Quick start
 
@@ -24,7 +32,7 @@ cargo build --release
 ### Library / CLI
 
 ```bash
-# create an index
+# create an index (default: EDEN-prod prefix @ 4 bits)
 mrl-index init ./my-index --dims 384 --strata full_64b
 
 # ingest lines from a file (one passage per line)
@@ -39,67 +47,51 @@ mrl-index query ./my-index "bitplane scan latency"
 | Path | Role |
 |------|------|
 | `manifest.json` | Config + segment bookkeeping |
-| `passages.jsonl` | Append-only raw text (primary store) |
-| `passages.idx` | Packed `{offset:u64, len:u32}` × N |
+| `eden_prefix.json` | EDEN-prod mean / seed / bit-depth (when enabled) |
+| `passages.bin` / `.idx` | Packed text + O(1) offsets |
 | `segments/000001.pax` | Contiguous `PaxBlock64` (4096 B each) |
 
-Each `PaxBlock64` holds 64 vectors at **64 B/vec**: header, f16 scale/offset/tail_norm, and six progressive bitplane strata (MRL sign → RaBitQ 1-bit → MSB refinements).
+Each `PaxBlock64` holds 64 vectors at **64 B/vec**: header, f16 meta, and progressive bitplane strata.
 
-## Tuning
+## Results snapshot
 
-See `EngineConfig` (`src/config.rs`) for the four axes from the design doc:
+On MS MARCO + EmbeddingGemma-2 @768 (1M docs, shortlist 256):
 
-- **Memory:** `strata_depth`, `slab_residency`, `numa_sharding`
-- **Pruning:** `shortlist_cand`, `cs_tolerance`, `rabitq_confidence`
-- **Latency:** `jit_batch_size`, `io_read_workers`, `max_latency_budget_ms`
-- **Lifecycle:** `ring_buffer_size`, `tombstone_compact_ratio`, `temporal_filter_enable`
+- EDEN-prod prefix vs legacy min–max: **R@10 0.8837 vs 0.8812**, scan ~**0.9×** latency
+- Dual EDEN on the mid-band **regressed** on 1M (−1.7pp) — left off by default
 
-## Embeddings
-
-The default `HashingEmbedder` is a deterministic CPU stand-in so the full scan → fetch → rerank loop runs without GPU drivers. Swap in MLX / CUDA / ONNX by implementing the `Embedder` trait (`src/rerank.rs`).
+Artifacts: `bench_results/eden/`.
 
 ## Benchmarks (MRL embeddings required)
 
-The design assumes **Matryoshka** embeddings. The preferred large-scale suite is
-**MS MARCO** embedded with **EmbeddingGemma 2** @ 768-d (parquet + dual ground truth):
+Preferred suite: **MS MARCO** + **EmbeddingGemma 2** @ 768-d:
 
 ```bash
-pip install -r modal/requirements.txt
-./scripts/check_modal_auth.sh
-modal run modal/embed_msmarco_gemma2.py --scale 1m --download-dir data/msmarco_gemma2/1m
-modal run modal/embed_msmarco_gemma2.py --scale full --download-dir data/msmarco_gemma2/full
-python3 scripts/validate_msmarco_bench.py data/msmarco_gemma2/1m
+# Convert Hub parquet → *_bin (see data/msmarco_gemma2/README.md)
+python3 scripts/parquet_to_bench_bin.py data/msmarco_gemma2/smoke data/msmarco_gemma2/smoke_bin
+
+./target/release/mrl-index bench-retrieval \
+  --label smoke --data data/msmarco_gemma2/smoke_bin \
+  --shortlist 256 --out reports/bench_smoke.json
 ```
 
-- Dataset: [`BeIR/msmarco`](https://huggingface.co/datasets/BeIR/msmarco) + [`BeIR/msmarco-qrels`](https://huggingface.co/datasets/BeIR/msmarco-qrels)
-- Model: [`google/embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2) (768-d MRL)
-- Artifacts: `corpus` / `queries` / `qrels` / `neighbors` parquet — see `data/msmarco_gemma2/README.md`
-- Note: MS MARCO has **8.84M** passages (no native 10M split); `full` uses the entire corpus
+## Tuning
 
-Legacy SEC 10-K @ nomic 384-d path (still supported by `bench-suite`):
+See `EngineConfig` (`src/config.rs`):
 
-```bash
-modal run modal/embed_sec10k_mrl.py --limit 50000 --download-dir data/sec10k_mrl
-cargo build --release
-./target/release/mrl-index bench-suite \
-  --embeddings data/sec10k_mrl \
-  --out bench_results/mrl_sec10k.json
-```
+- **Codec:** `prefix_codec` (`eden_prod` default, or `minmax4`), `mid_codec` (`rabitq` default)
+- **Memory:** `strata_depth`, `slab_residency`, `numa_sharding`
+- **Pruning:** `shortlist_cand`, `cs_tolerance`
+- **Latency:** `jit_batch_size`, `io_read_workers`, `max_latency_budget_ms`
 
-Plumbing-only isotropic vectors (not an MRL evaluation):
+## Embeddings
 
-```bash
-./target/release/mrl-index bench-suite --synthetic --out bench_results/synthetic.json
-```
+The default `HashingEmbedder` is a deterministic CPU stand-in so the full scan → fetch → rerank loop runs without GPU drivers. Swap in MLX / CUDA / ONNX by implementing the `Embedder` trait (`src/rerank.rs`). Optional local Gemma-2 path: `--gemma2` / `GEMMA2_SNAPSHOT`.
 
-See `bench_results/DELTA.md` for the earlier baseline → fix comparison (synthetic).
+## Docs
 
-## Develop
-
-```bash
-cargo test
-```
-
-## License
-
-MIT
+| Doc | Topic |
+|-----|--------|
+| [`docs/OVERVIEW.md`](docs/OVERVIEW.md) | Architecture for collaborators |
+| [`docs/PRIMITIVES_AND_COMPOSITION.md`](docs/PRIMITIVES_AND_COMPOSITION.md) | Scan stages / pipeline composition |
+| [`bench_results/eden/SUMMARY.md`](bench_results/eden/SUMMARY.md) | EDEN-prod probe decision record |

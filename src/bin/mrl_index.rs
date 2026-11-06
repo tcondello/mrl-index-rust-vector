@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use mrl_index::block::source;
-use mrl_index::config::{EngineConfig, SlabResidency, StrataDepth};
+use mrl_index::config::{EngineConfig, PrefixCodec, SlabResidency, StrataDepth};
 use mrl_index::gemma_embed::Gemma2Embedder;
 use mrl_index::IndexEngine;
 
@@ -28,6 +28,9 @@ enum Cmd {
         strata: String,
         #[arg(long, default_value_t = 64)]
         shortlist: usize,
+        /// Prefix codebook: `eden_prod` (default) or `minmax4` (legacy).
+        #[arg(long, default_value = "eden_prod")]
+        prefix_codec: String,
         /// Opt-in to local `google/embeddinggemma-2` (768-d) instead of the default demo `HashingEmbedder`.
         #[arg(long)]
         gemma2: bool,
@@ -178,6 +181,14 @@ fn parse_strata(s: &str) -> Result<StrataDepth> {
     })
 }
 
+fn parse_prefix_codec(s: &str) -> Result<PrefixCodec> {
+    Ok(match s {
+        "eden_prod" | "eden" | "EDEN_PROD" => PrefixCodec::EdenProd,
+        "minmax4" | "minmax" | "MINMAX4" => PrefixCodec::MinMax4,
+        other => bail!("unknown prefix codec: {other} (expected eden_prod|minmax4)"),
+    })
+}
+
 fn parse_source(s: &str) -> u32 {
     match s.to_lowercase().as_str() {
         "slack" => source::SLACK,
@@ -195,18 +206,22 @@ fn main() -> Result<()> {
             dims,
             strata,
             shortlist,
+            prefix_codec,
             gemma2,
         } => {
             let mut cfg = EngineConfig::default();
             cfg.embed_dims = dims.unwrap_or(if gemma2 { 768 } else { 384 });
             cfg.strata_depth = parse_strata(&strata)?;
             cfg.shortlist_cand = shortlist;
+            cfg.prefix_codec = parse_prefix_codec(&prefix_codec)?;
             cfg.use_gemma2 = gemma2;
+            let dims_v = cfg.embed_dims;
+            let prefix_v = cfg.prefix_codec;
             IndexEngine::create(&dir, cfg)?;
             println!(
-                "initialized mrl-index at {} (dims={}, embedder={})",
+                "initialized mrl-index at {} (dims={}, prefix={prefix_v:?}, embedder={})",
                 dir.display(),
-                dims.unwrap_or(if gemma2 { 768 } else { 384 }),
+                dims_v,
                 if gemma2 {
                     "google/embeddinggemma-2"
                 } else {

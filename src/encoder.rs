@@ -238,15 +238,33 @@ pub fn encode_f32_rows(encoder: &dyn Encoder, rows: &[Vec<f32>], default_source:
     out
 }
 
-/// Convenience: flush a ring-style pending batch through [`QuantizeEncoder`].
+/// Convenience: flush a ring-style pending batch.
+///
+/// When `eden` is set, the 64-d prefix uses EDEN-prod; otherwise min–max 4-bit.
 pub fn encode_pending_embeddings(
     embeddings: &[&[f32]],
     timestamps: &[u32],
     sources: &[u32],
 ) -> PaxBlock64 {
+    encode_pending_embeddings_eden(embeddings, timestamps, sources, None)
+}
+
+pub fn encode_pending_embeddings_eden(
+    embeddings: &[&[f32]],
+    timestamps: &[u32],
+    sources: &[u32],
+    eden: Option<&EdenFit>,
+) -> PaxBlock64 {
     assert!(!embeddings.is_empty());
     let dims = embeddings[0].len();
-    QuantizeEncoder::new(dims).encode_block(embeddings, timestamps, sources)
+    match eden {
+        Some(fit) => EdenPrefixEncoder {
+            dims,
+            fit: Arc::new(fit.clone()),
+        }
+        .encode_block(embeddings, timestamps, sources),
+        None => QuantizeEncoder::new(dims).encode_block(embeddings, timestamps, sources),
+    }
 }
 
 #[cfg(test)]

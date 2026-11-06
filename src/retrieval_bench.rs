@@ -16,9 +16,10 @@ use memmap2::{Advice, Mmap, MmapOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::block::{source, PaxBlock64};
-use crate::config::{EngineConfig, StrataDepth};
+use crate::config::{EngineConfig, PrefixCodec, StrataDepth};
 use crate::corpus::CorpusError;
-use crate::encoder::{encode_f32_corpus_par, QuantizeEncoder};
+use crate::eden::EdenFit;
+use crate::encoder::{encode_f32_corpus_par, EdenPrefixEncoder, QuantizeEncoder};
 use crate::pipeline::{scored_hits_to_row_ids, QueryPipeline};
 use crate::scan::ScoredHit;
 
@@ -256,9 +257,26 @@ fn read_f32_matrix(path: &Path, rows: usize, dims: usize) -> Result<Vec<f32>, Co
     Ok(out)
 }
 
-fn encode_corpus_mmap(emb: &MmapF32Matrix) -> Vec<PaxBlock64> {
-    let enc = QuantizeEncoder::new(emb.dims());
-    encode_f32_corpus_par(&enc, emb.as_slice(), emb.rows(), source::DOC)
+fn encode_corpus_mmap(emb: &MmapF32Matrix, prefix_codec: PrefixCodec, eden_seed: u64) -> (Vec<PaxBlock64>, Option<EdenFit>) {
+    match prefix_codec {
+        PrefixCodec::EdenProd => {
+            let fit = EdenFit::fit_prefix(
+                (0..emb.rows()).map(|i| emb.row(i)),
+                4,
+                eden_seed,
+            );
+            let enc = EdenPrefixEncoder::new(emb.dims(), fit.clone());
+            let blocks = encode_f32_corpus_par(&enc, emb.as_slice(), emb.rows(), source::DOC);
+            (blocks, Some(fit))
+        }
+        PrefixCodec::MinMax4 => {
+            let enc = QuantizeEncoder::new(emb.dims());
+            (
+                encode_f32_corpus_par(&enc, emb.as_slice(), emb.rows(), source::DOC),
+                None,
+            )
+        }
+    }
 }
 
 fn hit_ids(hits: &[ScoredHit]) -> Vec<usize> {
@@ -386,8 +404,10 @@ pub fn run_retrieval_bench_params(
 
     data.corpus_embeddings.advise_sequential();
     let t_enc = Instant::now();
-    eprintln!("encode PaxBlocks n={n} dims={dims} …");
-    let blocks = encode_corpus_mmap(&data.corpus_embeddings);
+    let prefix_codec = EngineConfig::default().prefix_codec;
+    let eden_seed = EngineConfig::default().eden_seed;
+    eprintln!("encode PaxBlocks n={n} dims={dims} prefix={prefix_codec:?} …");
+    let (blocks, eden_fit) = encode_corpus_mmap(&data.corpus_embeddings, prefix_codec, eden_seed);
     let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
         "encode done: {} blocks in {:.1} s",
@@ -397,7 +417,14 @@ pub fn run_retrieval_bench_params(
     data.corpus_embeddings.advise_random();
 
     Ok(eval_retrieval_on_blocks(
-        label, &data, &blocks, n_queries, params, encode_ms,
+        label,
+        &data,
+        &blocks,
+        n_queries,
+        params,
+        encode_ms,
+        prefix_codec,
+        eden_fit.as_ref(),
     ))
 }
 
@@ -423,8 +450,10 @@ pub fn run_retrieval_sweep(
 
     data.corpus_embeddings.advise_sequential();
     let t_enc = Instant::now();
-    eprintln!("encode PaxBlocks once n={n} dims={dims} (sweep reuses blocks) …");
-    let blocks = encode_corpus_mmap(&data.corpus_embeddings);
+    let prefix_codec = EngineConfig::default().prefix_codec;
+    let eden_seed = EngineConfig::default().eden_seed;
+    eprintln!("encode PaxBlocks once n={n} dims={dims} prefix={prefix_codec:?} (sweep reuses blocks) …");
+    let (blocks, eden_fit) = encode_corpus_mmap(&data.corpus_embeddings, prefix_codec, eden_seed);
     let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
         "encode done: {} blocks in {:.1} s — {} cells",
@@ -453,7 +482,14 @@ pub fn run_retrieval_sweep(
                     collect_scan_stats: false,
                 };
                 let report = eval_retrieval_on_blocks(
-                    &label, &data, &blocks, n_queries, params, encode_ms,
+                    &label,
+                    &data,
+                    &blocks,
+                    n_queries,
+                    params,
+                    encode_ms,
+                    prefix_codec,
+                    eden_fit.as_ref(),
                 );
                 report.print_summary();
                 if let Some(dir) = out_dir {
@@ -476,6 +512,8 @@ fn eval_retrieval_on_blocks(
     n_queries: usize,
     params: RetrievalBenchParams,
     encode_ms: f64,
+    prefix_codec: PrefixCodec,
+    eden_fit: Option<&EdenFit>,
 ) -> RetrievalBenchReport {
     let dims = data.dims();
     let n = data.n_corpus();
@@ -487,6 +525,7 @@ fn eval_retrieval_on_blocks(
     cfg.stratum4_weight = params.stratum4_weight;
     cfg.cs_tolerance = params.cs_tolerance;
     cfg.temporal_filter_enable = false;
+    cfg.prefix_codec = prefix_codec;
 
     let mut coverage10 = 0.0;
     let mut rerank10 = 0.0;
@@ -496,7 +535,12 @@ fn eval_retrieval_on_blocks(
     let mut qrels_n = 0usize;
     let mut scan_ms_sum = 0.0;
     let mut scan_stats = crate::scan::ScanStats::default();
-    let pipe = QueryPipeline::new(&cfg);
+    let pipe = match eden_fit {
+        Some(fit) if prefix_codec == PrefixCodec::EdenProd => {
+            QueryPipeline::with_eden(&cfg, fit)
+        }
+        _ => QueryPipeline::new(&cfg),
+    };
 
     let progress_every = (n_queries / 20).max(1);
     for qi in 0..n_queries {
@@ -649,8 +693,10 @@ pub fn run_precision_rerank_bench(
 
     data.corpus_embeddings.advise_sequential();
     let t_enc = Instant::now();
-    eprintln!("encode PaxBlocks n={n} dims={dims} …");
-    let blocks = encode_corpus_mmap(&data.corpus_embeddings);
+    let prefix_codec = EngineConfig::default().prefix_codec;
+    let eden_seed = EngineConfig::default().eden_seed;
+    eprintln!("encode PaxBlocks n={n} dims={dims} prefix={prefix_codec:?} …");
+    let (blocks, eden_fit) = encode_corpus_mmap(&data.corpus_embeddings, prefix_codec, eden_seed);
     let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
     data.corpus_embeddings.advise_random();
 
@@ -659,6 +705,7 @@ pub fn run_precision_rerank_bench(
     cfg.shortlist_cand = shortlist;
     cfg.strata_depth = strata;
     cfg.temporal_filter_enable = false;
+    cfg.prefix_codec = prefix_codec;
 
     let precisions = [
         RerankPrecision::Fp32,
@@ -672,7 +719,12 @@ pub fn run_precision_rerank_bench(
     let mut rerank_us = [0.0f64; 3];
     let mut scan_ms_sum = 0.0;
 
-    let pipe = QueryPipeline::new(&cfg);
+    let pipe = match eden_fit.as_ref() {
+        Some(fit) if prefix_codec == PrefixCodec::EdenProd => {
+            QueryPipeline::with_eden(&cfg, fit)
+        }
+        _ => QueryPipeline::new(&cfg),
+    };
     let progress_every = (n_queries / 20).max(1);
     for qi in 0..n_queries {
         let q = data.query_vector(qi);

@@ -123,7 +123,7 @@ fn find_local_gemma2_snapshot() -> PathBuf {
     if let Ok(p) = std::env::var("GEMMA2_SNAPSHOT") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/tim".into());
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let snaps_dir = PathBuf::from(home)
         .join(".cache/huggingface/hub/models--google--embeddinggemma-2/snapshots");
     if let Ok(entries) = std::fs::read_dir(&snaps_dir) {

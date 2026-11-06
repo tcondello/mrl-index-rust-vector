@@ -857,7 +857,9 @@ impl Gemma2Embedder {
         let hub_root = if let Ok(hf_home) = std::env::var("HF_HOME") {
             std::path::PathBuf::from(hf_home).join("hub")
         } else {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/tim".into());
+            let home = std::env::var("HOME").map_err(|_| {
+                "HOME is unset; set HOME or HF_HOME / GEMMA2_SNAPSHOT to locate the model".to_string()
+            })?;
             std::path::PathBuf::from(home).join(".cache/huggingface/hub")
         };
         let snaps_dir = hub_root.join("models--google--embeddinggemma-2/snapshots");
@@ -2543,9 +2545,11 @@ mod tests {
 
     #[test]
     fn real_hf_embeddinggemma2_snapshot_matches_pytorch_reference() {
-        let snap = Path::new(
-            "/Users/tim/.cache/huggingface/hub/models--google--embeddinggemma-2/snapshots/914f7f89142e33e77833254d9c9b90c3cef7303b",
-        );
+        // Opt-in: set GEMMA2_SNAPSHOT to a local google/embeddinggemma-2 dir.
+        let snap = match std::env::var_os("GEMMA2_SNAPSHOT") {
+            Some(p) => std::path::PathBuf::from(p),
+            None => return,
+        };
         if !snap.exists() {
             return;
         }

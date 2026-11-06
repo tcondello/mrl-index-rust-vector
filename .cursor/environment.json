@@ -1,4 +1,0 @@
-{
-  "install": "pip install --user 'modal>=0.73' && cargo build --release",
-  "start": "export PATH=\"$HOME/.local/bin:$PATH\""
-}

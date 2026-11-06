@@ -191,7 +191,9 @@ impl Default for EngineConfig {
             mrl_prefix: 64,
             final_top_k: 10,
             use_gemma2: false,
-            prefix_codec: PrefixCodec::MinMax4,
+            // EDEN-prod prefix b=4 won the 1M MS MARCO probe (+0.25pp R@10).
+            // Mid-band stays RaBitQ (dual EDEN mid regressed on 1M).
+            prefix_codec: PrefixCodec::EdenProd,
             eden_seed: 1,
             mid_codec: MidCodec::Rabitq,
         }
