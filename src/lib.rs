@@ -30,8 +30,11 @@ pub mod scan;
 pub mod segment;
 
 pub use block::{PaxBlock64, VectorId, VECTORS_PER_BLOCK, BLOCK_BYTES};
-pub use config::{EngineConfig, PrefixCodec, ScanConfig, SlabResidency, StrataDepth};
-pub use encoder::{AugmentedEncoder, EdenPrefixEncoder, Encoder, FusedPackedEncoder, QuantizeEncoder};
+pub use config::{EngineConfig, MidCodec, PrefixCodec, ScanConfig, SlabResidency, StrataDepth};
+pub use encoder::{
+    AugmentedEncoder, EdenDualEncoder, EdenPrefixEncoder, Encoder, FusedPackedEncoder,
+    QuantizeEncoder,
+};
 pub use geometry::SketchGeometry;
 pub use pipeline::{QueryPipeline, ScanPhase};
 pub use embed::HashingEmbedder;

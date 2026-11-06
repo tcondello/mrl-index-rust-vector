@@ -15,6 +15,18 @@ pub enum PrefixCodec {
     EdenProd,
 }
 
+/// How the 128-d mid-band (stratum 1) is coded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MidCodec {
+    /// FWHT + 1-bit RaBitQ signs (production default).
+    #[default]
+    Rabitq,
+    /// EDEN-prod b=1 on the mid-band (levels in stratum1; α packed in `meta.offset` when
+    /// prefix is also EDEN).
+    EdenB1,
+}
+
 /// How many bitplane strata are evaluated during scan ranking.
 ///
 /// Encode always packs the full `PaxBlock64`; this enum only gates which
@@ -148,6 +160,9 @@ pub struct EngineConfig {
     /// Structured-Hadamard seed when `prefix_codec == EdenProd`.
     #[serde(default = "default_eden_seed")]
     pub eden_seed: u64,
+    /// Mid-band codebook. `EdenB1` is experimental and expects EDEN prefix packing.
+    #[serde(default)]
+    pub mid_codec: MidCodec,
 }
 
 fn default_eden_seed() -> u64 {
@@ -178,6 +193,7 @@ impl Default for EngineConfig {
             use_gemma2: false,
             prefix_codec: PrefixCodec::MinMax4,
             eden_seed: 1,
+            mid_codec: MidCodec::Rabitq,
         }
     }
 }

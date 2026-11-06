@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use crate::block::{PaxBlock64, VECTORS_PER_BLOCK};
 use crate::eden::EdenFit;
-use crate::quantize::{encode_block, encode_block_from_augmented, encode_block_with_fit};
+use crate::quantize::{
+    encode_block, encode_block_from_augmented, encode_block_with_fit, encode_block_with_fits,
+};
 use crate::rerank::{PackedTokenBatch, UnifiedEmbedder};
 use crate::rotate::AUGMENTED_FULL_DIMS;
 
@@ -79,6 +81,50 @@ impl Encoder for EdenPrefixEncoder {
         sources: &[u32],
     ) -> PaxBlock64 {
         encode_block_with_fit(vectors, timestamps, sources, self.dims, Some(&self.fit))
+    }
+}
+
+/// EDEN-prod prefix (b=4) + EDEN-prod mid-band (b=1).
+#[derive(Debug, Clone)]
+pub struct EdenDualEncoder {
+    pub dims: usize,
+    pub prefix: Arc<EdenFit>,
+    pub mid: Arc<EdenFit>,
+}
+
+impl EdenDualEncoder {
+    pub fn new(dims: usize, prefix: EdenFit, mid: EdenFit) -> Self {
+        assert_eq!(prefix.dim, crate::block::MRL_PREFIX_DIMS);
+        assert_eq!(prefix.bits, 4);
+        assert_eq!(mid.dim, crate::block::RABITQ_DIMS);
+        assert_eq!(mid.bits, 1);
+        Self {
+            dims,
+            prefix: Arc::new(prefix),
+            mid: Arc::new(mid),
+        }
+    }
+}
+
+impl Encoder for EdenDualEncoder {
+    fn embed_dims(&self) -> usize {
+        self.dims
+    }
+
+    fn encode_block(
+        &self,
+        vectors: &[&[f32]],
+        timestamps: &[u32],
+        sources: &[u32],
+    ) -> PaxBlock64 {
+        encode_block_with_fits(
+            vectors,
+            timestamps,
+            sources,
+            self.dims,
+            Some(&self.prefix),
+            Some(&self.mid),
+        )
     }
 }
 

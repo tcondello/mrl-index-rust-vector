@@ -117,15 +117,26 @@ impl EdenFit {
         bits: u8,
         seed: u64,
     ) -> Self {
+        Self::fit_band(corpus_rows, 0, dim, bits, seed)
+    }
+
+    /// Fit mean on `row[start..start+dim]` for each corpus row.
+    pub fn fit_band(
+        corpus_rows: impl Iterator<Item = impl AsRef<[f32]>>,
+        start: usize,
+        dim: usize,
+        bits: u8,
+        seed: u64,
+    ) -> Self {
         assert!((1..=4).contains(&bits));
         assert!(dim.is_power_of_two(), "EDEN slice dim must be 2^k, got {dim}");
         let mut mean = vec![0.0f32; dim];
         let mut n = 0u64;
         for row in corpus_rows {
             let x = row.as_ref();
-            assert!(x.len() >= dim);
+            assert!(x.len() >= start + dim);
             for d in 0..dim {
-                mean[d] += x[d];
+                mean[d] += x[start + d];
             }
             n += 1;
         }

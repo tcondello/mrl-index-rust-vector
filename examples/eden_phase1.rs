@@ -1,7 +1,7 @@
-//! Phase 1: Pax-integrated EDEN-prod prefix vs min–max on smoke retrieval.
+//! Phase 1/2: Pax-integrated EDEN-prod prefix vs min–max retrieval A/B.
 //!
 //! Usage:
-//!   cargo run --release --example eden_phase1 -- data/msmarco_gemma2/smoke_bin [shortlist]
+//!   cargo run --release --example eden_phase1 -- <data_bin> [shortlist] [max_queries]
 
 use std::collections::HashSet;
 use std::env;
@@ -14,8 +14,6 @@ use mrl_index::eden::EdenFit;
 use mrl_index::encoder::{encode_f32_corpus_par, EdenPrefixEncoder, QuantizeEncoder};
 use mrl_index::pipeline::{scored_hits_to_row_ids, QueryPipeline};
 use mrl_index::retrieval_bench::RetrievalBenchData;
-use mrl_index::scan::ScanStats;
-
 fn recall_at_k(truth: &HashSet<usize>, pred: &[usize], k: usize) -> f64 {
     if truth.is_empty() {
         return 1.0;
@@ -30,10 +28,10 @@ fn eval_variant(
     prefix_codec: PrefixCodec,
     fit: Option<&EdenFit>,
     shortlist: usize,
+    n_queries: usize,
 ) -> serde_json::Value {
     let dims = data.dims();
     let n = data.n_corpus();
-    let n_queries = data.n_queries();
 
     let t_enc = Instant::now();
     let blocks = match (prefix_codec, fit) {
@@ -73,27 +71,30 @@ fn eval_variant(
     let mut coverage10 = 0.0;
     let mut rerank10 = 0.0;
     let mut scan_ms_sum = 0.0;
-    let mut scan_stats = ScanStats::default();
+    // Do not request ScanStats here — that forces the serial scan path.
 
+    let progress_every = (n_queries / 10).max(1);
     for qi in 0..n_queries {
         let q = data.query_vector(qi);
         let truth10: HashSet<usize> = data.neighbors[qi].iter().take(10).copied().collect();
-        let phase = pipe.scan_slab(q, &blocks, None, None, Some(&mut scan_stats));
+        let phase = pipe.scan_slab(q, &blocks, None, None, None);
         scan_ms_sum += phase.scan_ms;
         let ids = scored_hits_to_row_ids(&phase.hits);
         coverage10 += truth10.iter().filter(|i| ids.contains(i)).count() as f64 / 10.0;
         let reranked = QueryPipeline::rerank_exact_rows(q, &ids, |i| data.corpus_vector(i));
         let rerank_ids: Vec<usize> = reranked.into_iter().map(|(i, _)| i).collect();
         rerank10 += recall_at_k(&truth10, &rerank_ids, 10);
+        if (qi + 1) % progress_every == 0 || qi + 1 == n_queries {
+            let mean = scan_ms_sum / (qi + 1) as f64;
+            eprintln!(
+                "  [{label}] {done}/{n_queries}  mean_scan={mean:.1} ms/q",
+                done = qi + 1
+            );
+        }
     }
 
     let mean_scan_ms = scan_ms_sum / n_queries as f64;
     let mvecs = (n as f64 / (mean_scan_ms / 1000.0)) / 1e6;
-    let keep_prefix = if scan_stats.active_vecs > 0 {
-        100.0 * scan_stats.after_prefix as f64 / scan_stats.active_vecs as f64
-    } else {
-        0.0
-    };
 
     serde_json::json!({
         "label": label,
@@ -106,7 +107,6 @@ fn eval_variant(
         "mvecs_per_sec": mvecs,
         "shortlist_coverage_at_10": coverage10 / n_queries as f64,
         "reranked_recall_at_10": rerank10 / n_queries as f64,
-        "keep_after_prefix_pct": keep_prefix,
     })
 }
 
@@ -123,26 +123,40 @@ fn main() -> anyhow::Result<()> {
 
     let data = RetrievalBenchData::load(Path::new(&data_dir))?;
     let n = data.n_corpus();
+    let n_queries = env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| data.n_queries())
+        .min(data.n_queries());
+    let phase = if n >= 100_000 { 2 } else { 1 };
+    let out_name = if phase == 2 {
+        "phase2_1m.json"
+    } else {
+        "phase1_smoke.json"
+    };
+
     eprintln!("fitting EDEN mean on n={n} prefixes …");
     let fit = EdenFit::fit_prefix((0..n).map(|i| data.corpus_vector(i)), bits, seed);
 
     eprintln!("=== baseline min–max ===");
     let baseline = eval_variant(
-        "phase1-minmax",
+        &format!("phase{phase}-minmax"),
         &data,
         PrefixCodec::MinMax4,
         None,
         shortlist,
+        n_queries,
     );
     eprintln!("{baseline}");
 
     eprintln!("=== EDEN-prod prefix ===");
     let eden = eval_variant(
-        "phase1-eden",
+        &format!("phase{phase}-eden"),
         &data,
         PrefixCodec::EdenProd,
         Some(&fit),
         shortlist,
+        n_queries,
     );
     eprintln!("{eden}");
 
@@ -154,9 +168,10 @@ fn main() -> anyhow::Result<()> {
     let eden_ms = eden["mean_scan_ms"].as_f64().unwrap();
 
     let report = serde_json::json!({
-        "phase": 1,
+        "phase": phase,
         "data": data_dir,
         "shortlist": shortlist,
+        "n_queries": n_queries,
         "bits": bits,
         "seed": seed,
         "baseline": baseline,
@@ -166,12 +181,12 @@ fn main() -> anyhow::Result<()> {
         "scan_ms_ratio": eden_ms / base_ms.max(1e-9),
         "eden_wins_recall": eden_r > base_r + 0.005,
         "eden_ok_latency": eden_ms <= base_ms * 1.15,
-        "go_phase2": (eden_r >= base_r - 0.002) && (eden_ms <= base_ms * 1.20),
+        "go_followups": (eden_r >= base_r - 0.002) && (eden_ms <= base_ms * 1.20),
     });
 
     let out_dir = Path::new("bench_results/eden");
     std::fs::create_dir_all(out_dir)?;
-    let out = out_dir.join("phase1_smoke.json");
+    let out = out_dir.join(out_name);
     std::fs::write(&out, serde_json::to_string_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     eprintln!("wrote {}", out.display());

@@ -1,0 +1,30 @@
+{
+  "by_bits": {
+    "b2": {
+      "beats_minmax_R10": false,
+      "minmax4_R@10": 0.7851562499999993,
+      "minmax4_pearson": 0.9878237075172365,
+      "prefix_ip_pearson": 0.9375305585563183,
+      "prefix_rank_R@10": 0.5890625
+    },
+    "b3": {
+      "beats_minmax_R10": false,
+      "minmax4_R@10": 0.7851562499999993,
+      "minmax4_pearson": 0.9878237075172365,
+      "prefix_ip_pearson": 0.9822289072908461,
+      "prefix_rank_R@10": 0.7539062499999999
+    },
+    "b4": {
+      "beats_minmax_R10": true,
+      "minmax4_R@10": 0.7851562499999993,
+      "minmax4_pearson": 0.9878237075172365,
+      "prefix_ip_pearson": 0.9952029390260577,
+      "prefix_rank_R@10": 0.8718750000000006
+    }
+  },
+  "data": "data/msmarco_gemma2/smoke_bin",
+  "followup": "prefix_bitsweep",
+  "n": 8192,
+  "n_queries": 128,
+  "seed": 1
+}

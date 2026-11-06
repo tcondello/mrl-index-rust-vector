@@ -1,0 +1,42 @@
+{
+  "baseline": {
+    "encode_ms": 6.472515,
+    "label": "minmax",
+    "mean_scan_ms": 0.7168232890624999,
+    "n": 8192,
+    "n_queries": 128,
+    "reranked_recall_at_10": 0.9132812500000002,
+    "shortlist": 256,
+    "shortlist_coverage_at_10": 0.9132812500000002,
+    "variant": "MinMax"
+  },
+  "data": "data/msmarco_gemma2/smoke_bin",
+  "dual_scan_ms_ratio_vs_baseline": 0.9657188109504108,
+  "dual_vs_baseline_R10": 0.026562500000000266,
+  "dual_vs_prefix_R10": 0.022656250000000155,
+  "eden_dual": {
+    "encode_ms": 16.283260000000002,
+    "label": "eden-dual",
+    "mean_scan_ms": 0.692249734375,
+    "n": 8192,
+    "n_queries": 128,
+    "reranked_recall_at_10": 0.9398437500000004,
+    "shortlist": 256,
+    "shortlist_coverage_at_10": 0.9398437500000004,
+    "variant": "EdenDual"
+  },
+  "eden_prefix": {
+    "encode_ms": 13.661114,
+    "label": "eden-prefix",
+    "mean_scan_ms": 0.6961176562499999,
+    "n": 8192,
+    "n_queries": 128,
+    "reranked_recall_at_10": 0.9171875000000003,
+    "shortlist": 256,
+    "shortlist_coverage_at_10": 0.9171875000000003,
+    "variant": "EdenPrefix"
+  },
+  "followup": "eden_dual_smoke",
+  "seed": 1,
+  "shortlist": 256
+}

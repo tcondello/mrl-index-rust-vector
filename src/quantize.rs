@@ -20,13 +20,26 @@ pub fn encode_block(
 }
 
 /// Like [`encode_block`], but when `eden` is set the 64-d prefix uses EDEN-prod
-/// (`meta.scale = α = ‖x−μ‖·S`, `meta.offset = 0`, levels in the 4 bitplanes).
+/// (`meta.scale = α = ‖x−μ‖·S`, levels in the 4 bitplanes).
+///
+/// Optional `eden_mid` (b=1) stores mid α in `meta.offset` and levels in stratum1.
 pub fn encode_block_with_fit(
     vectors: &[&[f32]],
     timestamps: &[u32],
     sources: &[u32],
     dims: usize,
     eden: Option<&EdenFit>,
+) -> PaxBlock64 {
+    encode_block_with_fits(vectors, timestamps, sources, dims, eden, None)
+}
+
+pub fn encode_block_with_fits(
+    vectors: &[&[f32]],
+    timestamps: &[u32],
+    sources: &[u32],
+    dims: usize,
+    eden: Option<&EdenFit>,
+    eden_mid: Option<&EdenFit>,
 ) -> PaxBlock64 {
     assert!(!vectors.is_empty() && vectors.len() <= VECTORS_PER_BLOCK);
     assert_eq!(timestamps.len(), vectors.len());
@@ -35,6 +48,9 @@ pub fn encode_block_with_fit(
     if let Some(fit) = eden {
         assert_eq!(fit.dim, MRL_PREFIX_DIMS);
         assert_eq!(fit.bits, 4, "Pax 4-bit planes require EDEN bits=4");
+    }
+    if eden_mid.is_some() {
+        assert!(eden.is_some(), "eden_mid requires eden prefix fit");
     }
 
     let mut block = PaxBlock64::zeroed();
@@ -55,7 +71,7 @@ pub fn encode_block_with_fit(
         source_mask |= src;
 
         let (meta, bits4, rabitq, fold_bits) = match eden {
-            Some(fit) => quantize_vector_eden(fit, vec),
+            Some(fit) => quantize_vector_eden_dual(fit, eden_mid, vec),
             None => quantize_vector(vec),
         };
         block.meta[i] = meta;
@@ -239,13 +255,42 @@ pub fn quantize_vector_eden(
     [u8; RABITQ_DIMS],
     [u8; TAIL_FOLD_DIMS],
 ) {
-    let code = encode_slice(fit, vec);
+    quantize_vector_eden_dual(fit, None, vec)
+}
+
+/// EDEN-prod prefix + optional EDEN b=1 mid-band.
+///
+/// When `mid` is set: stratum1 stores Lloyd–Max levels (0/1), `meta.scale` = prefix α,
+/// `meta.offset` = mid α. Tail fold unchanged.
+pub fn quantize_vector_eden_dual(
+    prefix_fit: &EdenFit,
+    mid_fit: Option<&EdenFit>,
+    vec: &[f32],
+) -> (
+    VectorMeta,
+    [u8; MRL_PREFIX_DIMS],
+    [u8; RABITQ_DIMS],
+    [u8; TAIL_FOLD_DIMS],
+) {
+    let code = encode_slice(prefix_fit, vec);
     let mut bits4 = [0u8; MRL_PREFIX_DIMS];
     bits4.copy_from_slice(&code.levels[..MRL_PREFIX_DIMS]);
-    let (rabitq, fold_bits) = mid_and_fold_bits(vec);
+
+    let (rabitq, mid_alpha) = if let Some(mf) = mid_fit {
+        assert_eq!(mf.dim, RABITQ_DIMS);
+        assert_eq!(mf.bits, 1);
+        let mid = &vec[MRL_PREFIX_DIMS..MRL_PREFIX_DIMS + RABITQ_DIMS];
+        let mc = encode_slice(mf, mid);
+        let mut bits = [0u8; RABITQ_DIMS];
+        bits.copy_from_slice(&mc.levels[..RABITQ_DIMS]);
+        (bits, mc.alpha())
+    } else {
+        (mid_and_fold_bits(vec).0, 0.0)
+    };
+
+    let fold_bits = mid_and_fold_bits(vec).1;
     let (rest_norm, _high_norm, flags) = residual_norms(vec);
-    // Pack α into scale; offset unused (0).
-    let meta = VectorMeta::from_f32(code.alpha(), 0.0, rest_norm, flags);
+    let meta = VectorMeta::from_f32(code.alpha(), mid_alpha, rest_norm, flags);
     (meta, bits4, rabitq, fold_bits)
 }
 

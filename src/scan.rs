@@ -12,7 +12,7 @@ use crate::block::{
     PaxBlock64, VectorId, MRL_PREFIX_DIMS, RABITQ_DIMS, TAIL_FOLD_DIMS, TAIL_START,
     VECTORS_PER_BLOCK,
 };
-use crate::config::{EngineConfig, PrefixCodec, ScanConfig};
+use crate::config::{EngineConfig, MidCodec, PrefixCodec, ScanConfig};
 use crate::eden::{lloyd_max_normal, rotate_query, EdenFit};
 use crate::rotate::{rabitq_bit_scale, rotate_mid_band, rotate_tail_fold, tail_fold_bit_scale};
 
@@ -21,6 +21,7 @@ use crate::rotate::{rabitq_bit_scale, rotate_mid_band, rotate_tail_fold, tail_fo
 pub struct QueryPlan {
     pub dims: usize,
     pub prefix_codec: PrefixCodec,
+    pub mid_codec: MidCodec,
     pub prefix: [f32; MRL_PREFIX_DIMS],
     /// Per-dim weights for bits 0..3: `q_d * 2^k`.
     pub bit_weights: [[f32; 4]; MRL_PREFIX_DIMS],
@@ -59,22 +60,55 @@ pub struct QueryPlan {
     pub eden_inv_sqrt_d: f32,
     /// EDEN: per-level centroid values (length 16 for b=4).
     pub eden_codebook: [f32; 16],
+    /// EDEN mid: R(q_mid).
+    pub eden_mid_q_rot: [f32; RABITQ_DIMS],
+    /// EDEN mid: ⟨q_mid, μ_mid⟩.
+    pub eden_mid_mean_ip: f32,
+    /// EDEN mid: 1/√128.
+    pub eden_mid_inv_sqrt_d: f32,
+    /// EDEN mid: Lloyd–Max b=1 centroids (±√(2/π)).
+    pub eden_mid_codebook: [f32; 2],
 }
 
 impl QueryPlan {
     pub fn from_query(query: &[f32], dims: usize) -> Self {
-        Self::from_query_codec(query, dims, PrefixCodec::MinMax4, None)
+        Self::from_query_codec(query, dims, PrefixCodec::MinMax4, MidCodec::Rabitq, None, None)
     }
 
     pub fn from_query_eden(query: &[f32], dims: usize, fit: &EdenFit) -> Self {
-        Self::from_query_codec(query, dims, PrefixCodec::EdenProd, Some(fit))
+        Self::from_query_codec(
+            query,
+            dims,
+            PrefixCodec::EdenProd,
+            MidCodec::Rabitq,
+            Some(fit),
+            None,
+        )
+    }
+
+    pub fn from_query_eden_dual(
+        query: &[f32],
+        dims: usize,
+        prefix: &EdenFit,
+        mid: &EdenFit,
+    ) -> Self {
+        Self::from_query_codec(
+            query,
+            dims,
+            PrefixCodec::EdenProd,
+            MidCodec::EdenB1,
+            Some(prefix),
+            Some(mid),
+        )
     }
 
     pub fn from_query_codec(
         query: &[f32],
         dims: usize,
         prefix_codec: PrefixCodec,
+        mid_codec: MidCodec,
         eden: Option<&EdenFit>,
+        eden_mid: Option<&EdenFit>,
     ) -> Self {
         assert_eq!(query.len(), dims);
         assert!(dims >= MRL_PREFIX_DIMS + RABITQ_DIMS);
@@ -82,6 +116,11 @@ impl QueryPlan {
             let fit = eden.expect("EdenProd requires EdenFit");
             assert_eq!(fit.dim, MRL_PREFIX_DIMS);
             assert_eq!(fit.bits, 4);
+        }
+        if mid_codec == MidCodec::EdenB1 {
+            let mf = eden_mid.expect("EdenB1 mid requires EdenFit");
+            assert_eq!(mf.dim, RABITQ_DIMS);
+            assert_eq!(mf.bits, 1);
         }
 
         let mut prefix = [0.0f32; MRL_PREFIX_DIMS];
@@ -115,6 +154,23 @@ impl QueryPlan {
             for (i, &c) in cb.iter().enumerate() {
                 eden_codebook[i] = c;
             }
+        }
+
+        let mut eden_mid_q_rot = [0.0f32; RABITQ_DIMS];
+        let mut eden_mid_mean_ip = 0.0f32;
+        let mut eden_mid_inv_sqrt_d = 1.0 / (RABITQ_DIMS as f32).sqrt();
+        let mut eden_mid_codebook = [0.0f32; 2];
+        if let Some(mf) = eden_mid {
+            let mid_raw = &query[MRL_PREFIX_DIMS..MRL_PREFIX_DIMS + RABITQ_DIMS];
+            let rot = rotate_query(mf, mid_raw);
+            eden_mid_q_rot.copy_from_slice(&rot);
+            for d in 0..RABITQ_DIMS {
+                eden_mid_mean_ip += mid_raw[d] * mf.mean[d];
+            }
+            eden_mid_inv_sqrt_d = 1.0 / (mf.dim as f32).sqrt();
+            let cb = lloyd_max_normal(1);
+            eden_mid_codebook[0] = cb[0];
+            eden_mid_codebook[1] = cb[1];
         }
 
         let mid = &query[MRL_PREFIX_DIMS..MRL_PREFIX_DIMS + RABITQ_DIMS];
@@ -179,6 +235,7 @@ impl QueryPlan {
         Self {
             dims,
             prefix_codec,
+            mid_codec,
             prefix,
             bit_weights,
             rabitq_q,
@@ -201,6 +258,10 @@ impl QueryPlan {
             eden_mean_ip,
             eden_inv_sqrt_d,
             eden_codebook,
+            eden_mid_q_rot,
+            eden_mid_mean_ip,
+            eden_mid_inv_sqrt_d,
+            eden_mid_codebook,
         }
     }
 }
@@ -455,8 +516,40 @@ pub fn stage_prefix_ip_and_cs_split(ctx: &BlockScanCtx<'_>, state: &mut BlockSca
     state.survivors = survivors;
 }
 
-/// Stage: RaBitQ 1-bit mid-band IP for current survivors.
+/// Stage: RaBitQ 1-bit mid-band IP (or EDEN b=1) for current survivors.
 pub fn stage_rabitq_ip(ctx: &BlockScanCtx<'_>, state: &mut BlockScanState) {
+    if ctx.plan.mid_codec == MidCodec::EdenB1 {
+        // All-zero level baseline + deltas for bit=1 (Lloyd–Max b=1).
+        let mut base = 0.0f32;
+        let mut deltas = [0.0f32; RABITQ_DIMS];
+        let c0 = ctx.plan.eden_mid_codebook[0];
+        let c1 = ctx.plan.eden_mid_codebook[1];
+        let inv = ctx.plan.eden_mid_inv_sqrt_d;
+        for d in 0..RABITQ_DIMS {
+            let q = ctx.plan.eden_mid_q_rot[d] * inv;
+            base += c0 * q;
+            deltas[d] = (c1 - c0) * q;
+        }
+        let mut cw_dot = [base; VECTORS_PER_BLOCK];
+        for d in 0..RABITQ_DIMS {
+            let mut bits = ctx.block.stratum1_rabitq.dim_bits[d] & state.survivors;
+            let delta = deltas[d];
+            while bits != 0 {
+                let v = bits.trailing_zeros() as usize;
+                cw_dot[v] += delta;
+                bits &= bits - 1;
+            }
+        }
+        let mut s_bits = state.survivors;
+        while s_bits != 0 {
+            let v = s_bits.trailing_zeros() as usize;
+            let mid_alpha = ctx.block.meta[v].offset_f32();
+            state.scores[v] += ctx.plan.eden_mid_mean_ip + mid_alpha * cw_dot[v];
+            s_bits &= s_bits - 1;
+        }
+        return;
+    }
+
     let mut s1_dot = [ctx.plan.rabitq_base; VECTORS_PER_BLOCK];
     for d in 0..RABITQ_DIMS {
         let mut bits = ctx.block.stratum1_rabitq.dim_bits[d] & state.survivors;

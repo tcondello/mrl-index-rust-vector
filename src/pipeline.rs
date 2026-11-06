@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use crate::block::{PaxBlock64, VectorId, VECTORS_PER_BLOCK};
-use crate::config::{EngineConfig, PrefixCodec};
+use crate::config::{EngineConfig, MidCodec, PrefixCodec};
 use crate::eden::EdenFit;
 use crate::embed::dot;
 use crate::scan::{
@@ -19,6 +19,7 @@ use crate::segment::SegmentReader;
 pub struct QueryPipeline<'a> {
     pub cfg: &'a EngineConfig,
     pub eden: Option<&'a EdenFit>,
+    pub eden_mid: Option<&'a EdenFit>,
 }
 
 /// Result of a plan+scan phase (no fetch / neural rerank).
@@ -32,20 +33,40 @@ pub struct ScanPhase {
 
 impl<'a> QueryPipeline<'a> {
     pub fn new(cfg: &'a EngineConfig) -> Self {
-        Self { cfg, eden: None }
+        Self {
+            cfg,
+            eden: None,
+            eden_mid: None,
+        }
     }
 
     pub fn with_eden(cfg: &'a EngineConfig, fit: &'a EdenFit) -> Self {
         Self {
             cfg,
             eden: Some(fit),
+            eden_mid: None,
+        }
+    }
+
+    pub fn with_eden_dual(
+        cfg: &'a EngineConfig,
+        prefix: &'a EdenFit,
+        mid: &'a EdenFit,
+    ) -> Self {
+        Self {
+            cfg,
+            eden: Some(prefix),
+            eden_mid: Some(mid),
         }
     }
 
     pub fn build_plan(&self, query: &[f32]) -> QueryPlan {
         debug_assert_eq!(query.len(), self.cfg.embed_dims);
-        match (self.cfg.prefix_codec, self.eden) {
-            (PrefixCodec::EdenProd, Some(fit)) => {
+        match (self.cfg.prefix_codec, self.cfg.mid_codec, self.eden, self.eden_mid) {
+            (PrefixCodec::EdenProd, MidCodec::EdenB1, Some(p), Some(m)) => {
+                QueryPlan::from_query_eden_dual(query, self.cfg.embed_dims, p, m)
+            }
+            (PrefixCodec::EdenProd, _, Some(fit), _) => {
                 QueryPlan::from_query_eden(query, self.cfg.embed_dims, fit)
             }
             _ => QueryPlan::from_query(query, self.cfg.embed_dims),

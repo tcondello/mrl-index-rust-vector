@@ -1,10 +1,9 @@
 {
   "baseline": {
-    "encode_ms": 8.349169999999999,
-    "keep_after_prefix_pct": 100.0,
+    "encode_ms": 8.633111000000001,
     "label": "phase1-minmax",
-    "mean_scan_ms": 1.1138497031250005,
-    "mvecs_per_sec": 7.354672696878801,
+    "mean_scan_ms": 0.8534549843750003,
+    "mvecs_per_sec": 9.598631620857123,
     "n": 8192,
     "n_queries": 128,
     "prefix_codec": "MinMax4",
@@ -17,11 +16,10 @@
   "delta_coverage10": 0.003906250000000111,
   "delta_reranked_R10": 0.003906250000000111,
   "eden": {
-    "encode_ms": 10.593632000000001,
-    "keep_after_prefix_pct": 100.0,
+    "encode_ms": 14.395269,
     "label": "phase1-eden",
-    "mean_scan_ms": 1.0327607109374999,
-    "mvecs_per_sec": 7.932137535096221,
+    "mean_scan_ms": 0.8077090937499996,
+    "mvecs_per_sec": 10.142265406430562,
     "n": 8192,
     "n_queries": 128,
     "prefix_codec": "EdenProd",
@@ -31,9 +29,10 @@
   },
   "eden_ok_latency": true,
   "eden_wins_recall": false,
-  "go_phase2": true,
+  "go_followups": true,
+  "n_queries": 128,
   "phase": 1,
-  "scan_ms_ratio": 0.9271993412037561,
+  "scan_ms_ratio": 0.9463991757473872,
   "seed": 1,
   "shortlist": 256
 }

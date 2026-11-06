@@ -1,0 +1,17 @@
+{
+  "data": "data/msmarco_gemma2/smoke_bin",
+  "eden_wins_R10": true,
+  "eden_wins_pearson": true,
+  "followup": "midband_eden_b1_vs_rabitq",
+  "mid_ip_pearson": {
+    "eden_b1": 0.7458999995142221,
+    "rabitq": 0.6579784224741161
+  },
+  "mid_rank_R@10": {
+    "eden_b1": 0.3203124999999997,
+    "rabitq": 0.2640625
+  },
+  "n": 8192,
+  "n_queries": 128,
+  "seed": 1
+}
