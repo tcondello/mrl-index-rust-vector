@@ -4,6 +4,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::geometry::SketchGeometry;
 
+/// How the leading MRL prefix (64-d, 4 bitplanes) is coded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixCodec {
+    /// Per-vector affine min–max on raw prefix coords (production default).
+    #[default]
+    MinMax4,
+    /// EDEN-prod: center → normalize → structured Hadamard → Lloyd–Max (unbiased).
+    EdenProd,
+}
+
 /// How many bitplane strata are evaluated during scan ranking.
 ///
 /// Encode always packs the full `PaxBlock64`; this enum only gates which
@@ -131,6 +142,16 @@ pub struct EngineConfig {
     /// Opt-in flag to use local `google/embeddinggemma-2` (768-d) instead of the default demo `HashingEmbedder`.
     #[serde(default)]
     pub use_gemma2: bool,
+    /// Prefix codebook (min–max vs EDEN-prod). Default keeps historical bits.
+    #[serde(default)]
+    pub prefix_codec: PrefixCodec,
+    /// Structured-Hadamard seed when `prefix_codec == EdenProd`.
+    #[serde(default = "default_eden_seed")]
+    pub eden_seed: u64,
+}
+
+fn default_eden_seed() -> u64 {
+    1
 }
 
 impl Default for EngineConfig {
@@ -155,6 +176,8 @@ impl Default for EngineConfig {
             mrl_prefix: 64,
             final_top_k: 10,
             use_gemma2: false,
+            prefix_codec: PrefixCodec::MinMax4,
+            eden_seed: 1,
         }
     }
 }

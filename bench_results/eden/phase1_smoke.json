@@ -1,0 +1,39 @@
+{
+  "baseline": {
+    "encode_ms": 8.349169999999999,
+    "keep_after_prefix_pct": 100.0,
+    "label": "phase1-minmax",
+    "mean_scan_ms": 1.1138497031250005,
+    "mvecs_per_sec": 7.354672696878801,
+    "n": 8192,
+    "n_queries": 128,
+    "prefix_codec": "MinMax4",
+    "reranked_recall_at_10": 0.9132812500000002,
+    "shortlist": 256,
+    "shortlist_coverage_at_10": 0.9132812500000002
+  },
+  "bits": 4,
+  "data": "data/msmarco_gemma2/smoke_bin",
+  "delta_coverage10": 0.003906250000000111,
+  "delta_reranked_R10": 0.003906250000000111,
+  "eden": {
+    "encode_ms": 10.593632000000001,
+    "keep_after_prefix_pct": 100.0,
+    "label": "phase1-eden",
+    "mean_scan_ms": 1.0327607109374999,
+    "mvecs_per_sec": 7.932137535096221,
+    "n": 8192,
+    "n_queries": 128,
+    "prefix_codec": "EdenProd",
+    "reranked_recall_at_10": 0.9171875000000003,
+    "shortlist": 256,
+    "shortlist_coverage_at_10": 0.9171875000000003
+  },
+  "eden_ok_latency": true,
+  "eden_wins_recall": false,
+  "go_phase2": true,
+  "phase": 1,
+  "scan_ms_ratio": 0.9271993412037561,
+  "seed": 1,
+  "shortlist": 256
+}

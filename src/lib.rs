@@ -12,6 +12,7 @@ pub mod benchmark;
 pub mod block;
 pub mod config;
 pub mod corpus;
+pub mod eden;
 pub mod embed;
 pub mod encoder;
 pub mod engine;
@@ -29,8 +30,8 @@ pub mod scan;
 pub mod segment;
 
 pub use block::{PaxBlock64, VectorId, VECTORS_PER_BLOCK, BLOCK_BYTES};
-pub use config::{EngineConfig, ScanConfig, SlabResidency, StrataDepth};
-pub use encoder::{AugmentedEncoder, Encoder, FusedPackedEncoder, QuantizeEncoder};
+pub use config::{EngineConfig, PrefixCodec, ScanConfig, SlabResidency, StrataDepth};
+pub use encoder::{AugmentedEncoder, EdenPrefixEncoder, Encoder, FusedPackedEncoder, QuantizeEncoder};
 pub use geometry::SketchGeometry;
 pub use pipeline::{QueryPipeline, ScanPhase};
 pub use embed::HashingEmbedder;

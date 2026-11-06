@@ -12,13 +12,15 @@ use crate::block::{
     PaxBlock64, VectorId, MRL_PREFIX_DIMS, RABITQ_DIMS, TAIL_FOLD_DIMS, TAIL_START,
     VECTORS_PER_BLOCK,
 };
-use crate::config::{EngineConfig, ScanConfig};
+use crate::config::{EngineConfig, PrefixCodec, ScanConfig};
+use crate::eden::{lloyd_max_normal, rotate_query, EdenFit};
 use crate::rotate::{rabitq_bit_scale, rotate_mid_band, rotate_tail_fold, tail_fold_bit_scale};
 
 /// Precomputed query side for bitplane scoring.
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
     pub dims: usize,
+    pub prefix_codec: PrefixCodec,
     pub prefix: [f32; MRL_PREFIX_DIMS],
     /// Per-dim weights for bits 0..3: `q_d * 2^k`.
     pub bit_weights: [[f32; 4]; MRL_PREFIX_DIMS],
@@ -49,12 +51,38 @@ pub struct QueryPlan {
     pub prefix_l1: f32,
     /// Σ q_d over prefix — for O(1) affine offset dot product.
     pub prefix_sum: f32,
+    /// EDEN: R(q_prefix) in codebook domain.
+    pub eden_q_rot: [f32; MRL_PREFIX_DIMS],
+    /// EDEN: ⟨q_prefix, μ⟩.
+    pub eden_mean_ip: f32,
+    /// EDEN: 1/√d for Lloyd–Max codewords.
+    pub eden_inv_sqrt_d: f32,
+    /// EDEN: per-level centroid values (length 16 for b=4).
+    pub eden_codebook: [f32; 16],
 }
 
 impl QueryPlan {
     pub fn from_query(query: &[f32], dims: usize) -> Self {
+        Self::from_query_codec(query, dims, PrefixCodec::MinMax4, None)
+    }
+
+    pub fn from_query_eden(query: &[f32], dims: usize, fit: &EdenFit) -> Self {
+        Self::from_query_codec(query, dims, PrefixCodec::EdenProd, Some(fit))
+    }
+
+    pub fn from_query_codec(
+        query: &[f32],
+        dims: usize,
+        prefix_codec: PrefixCodec,
+        eden: Option<&EdenFit>,
+    ) -> Self {
         assert_eq!(query.len(), dims);
         assert!(dims >= MRL_PREFIX_DIMS + RABITQ_DIMS);
+        if prefix_codec == PrefixCodec::EdenProd {
+            let fit = eden.expect("EdenProd requires EdenFit");
+            assert_eq!(fit.dim, MRL_PREFIX_DIMS);
+            assert_eq!(fit.bits, 4);
+        }
 
         let mut prefix = [0.0f32; MRL_PREFIX_DIMS];
         prefix.copy_from_slice(&query[..MRL_PREFIX_DIMS]);
@@ -70,6 +98,23 @@ impl QueryPlan {
             bit_weights[d][1] = q * 2.0;
             bit_weights[d][2] = q * 4.0;
             bit_weights[d][3] = q * 8.0;
+        }
+
+        let mut eden_q_rot = [0.0f32; MRL_PREFIX_DIMS];
+        let mut eden_mean_ip = 0.0f32;
+        let mut eden_inv_sqrt_d = 1.0 / (MRL_PREFIX_DIMS as f32).sqrt();
+        let mut eden_codebook = [0.0f32; 16];
+        if let Some(fit) = eden {
+            let rot = rotate_query(fit, query);
+            eden_q_rot.copy_from_slice(&rot);
+            for d in 0..MRL_PREFIX_DIMS {
+                eden_mean_ip += query[d] * fit.mean[d];
+            }
+            eden_inv_sqrt_d = 1.0 / (fit.dim as f32).sqrt();
+            let cb = lloyd_max_normal(fit.bits);
+            for (i, &c) in cb.iter().enumerate() {
+                eden_codebook[i] = c;
+            }
         }
 
         let mid = &query[MRL_PREFIX_DIMS..MRL_PREFIX_DIMS + RABITQ_DIMS];
@@ -133,6 +178,7 @@ impl QueryPlan {
 
         Self {
             dims,
+            prefix_codec,
             prefix,
             bit_weights,
             rabitq_q,
@@ -151,6 +197,10 @@ impl QueryPlan {
             s4_abs_budget,
             prefix_l1,
             prefix_sum,
+            eden_q_rot,
+            eden_mean_ip,
+            eden_inv_sqrt_d,
+            eden_codebook,
         }
     }
 }
@@ -340,10 +390,15 @@ pub struct BlockScanCtx<'a> {
 ///
 /// `ub = prefix_ip + α (‖q_mid‖ ‖x_mid‖ + ‖q_tail‖ ‖x_tail‖)`.
 pub fn stage_prefix_ip_and_cs_split(ctx: &BlockScanCtx<'_>, state: &mut BlockScanState) {
+    let use_eden = ctx.plan.prefix_codec == PrefixCodec::EdenProd;
     let mut acc = [[0.0f32; 8]; 8];
     for d in 0..MRL_PREFIX_DIMS {
-        let q = ctx.plan.prefix[d];
-        if q == 0.0 {
+        let weight = if use_eden {
+            ctx.plan.eden_q_rot[d] * ctx.plan.eden_inv_sqrt_d
+        } else {
+            ctx.plan.prefix[d]
+        };
+        if weight == 0.0 {
             continue;
         }
         let b0 = ctx.block.stratum5_lsb.dim_bits[d];
@@ -357,8 +412,15 @@ pub fn stage_prefix_ip_and_cs_split(ctx: &BlockScanCtx<'_>, state: &mut BlockSca
                 | (((b2 >> s) & SWAR_M8) << 2)
                 | (((b3 >> s) & SWAR_M8) << 3);
             let bytes = packed.to_le_bytes();
-            for k in 0..8 {
-                acc[s][k] += (bytes[k] as f32) * q;
+            if use_eden {
+                for k in 0..8 {
+                    let level = bytes[k] as usize;
+                    acc[s][k] += ctx.plan.eden_codebook[level] * weight;
+                }
+            } else {
+                for k in 0..8 {
+                    acc[s][k] += (bytes[k] as f32) * weight;
+                }
             }
         }
     }
@@ -372,9 +434,14 @@ pub fn stage_prefix_ip_and_cs_split(ctx: &BlockScanCtx<'_>, state: &mut BlockSca
         state.mid_n[v] = ctx.block.meta[v].mid_norm_f32().max(1e-6);
         state.high_n[v] = ctx.block.meta[v].high_tail_norm_f32().max(0.0);
         let scale = ctx.block.meta[v].scale_f32();
-        let offset = ctx.block.meta[v].offset_f32();
         let code_dot_v = acc[v & 7][v >> 3];
-        let prefix_ip = code_dot_v * scale + offset * ctx.plan.prefix_sum;
+        let prefix_ip = if use_eden {
+            // meta.scale holds α = ‖x−μ‖·S; offset unused.
+            ctx.plan.eden_mean_ip + scale * code_dot_v
+        } else {
+            let offset = ctx.block.meta[v].offset_f32();
+            code_dot_v * scale + offset * ctx.plan.prefix_sum
+        };
         state.scores[v] = prefix_ip;
 
         let ub = prefix_ip

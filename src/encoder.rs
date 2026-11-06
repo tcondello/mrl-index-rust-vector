@@ -4,8 +4,11 @@
 //! [`Encoder`] + [`encode_f32_corpus_par`]. The Gemma fused path uses
 //! [`FusedPackedEncoder`] (implemented for any [`UnifiedEmbedder`]).
 
+use std::sync::Arc;
+
 use crate::block::{PaxBlock64, VECTORS_PER_BLOCK};
-use crate::quantize::{encode_block, encode_block_from_augmented};
+use crate::eden::EdenFit;
+use crate::quantize::{encode_block, encode_block_from_augmented, encode_block_with_fit};
 use crate::rerank::{PackedTokenBatch, UnifiedEmbedder};
 use crate::rotate::AUGMENTED_FULL_DIMS;
 
@@ -45,6 +48,37 @@ impl Encoder for QuantizeEncoder {
         sources: &[u32],
     ) -> PaxBlock64 {
         encode_block(vectors, timestamps, sources, self.dims)
+    }
+}
+
+/// Encoder that writes EDEN-prod codes into the 4-bit MRL prefix planes.
+#[derive(Debug, Clone)]
+pub struct EdenPrefixEncoder {
+    pub dims: usize,
+    pub fit: Arc<EdenFit>,
+}
+
+impl EdenPrefixEncoder {
+    pub fn new(dims: usize, fit: EdenFit) -> Self {
+        Self {
+            dims,
+            fit: Arc::new(fit),
+        }
+    }
+}
+
+impl Encoder for EdenPrefixEncoder {
+    fn embed_dims(&self) -> usize {
+        self.dims
+    }
+
+    fn encode_block(
+        &self,
+        vectors: &[&[f32]],
+        timestamps: &[u32],
+        sources: &[u32],
+    ) -> PaxBlock64 {
+        encode_block_with_fit(vectors, timestamps, sources, self.dims, Some(&self.fit))
     }
 }
 

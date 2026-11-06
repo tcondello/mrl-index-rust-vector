@@ -1,0 +1,31 @@
+{
+  "bits": 4,
+  "data": "data/msmarco_gemma2/smoke_bin",
+  "eden_wins_mse": true,
+  "eden_wins_pearson": true,
+  "eden_wins_prefix_R10": true,
+  "full_top10_in_prefix_top256": {
+    "eden": 0.6507812499999998,
+    "minmax4": 0.6523437499999999
+  },
+  "full_top10_in_prefix_top64": {
+    "eden": 0.40859375,
+    "minmax4": 0.40781249999999986
+  },
+  "n": 8192,
+  "n_queries": 128,
+  "phase": 0,
+  "prefix_ip_pearson": {
+    "eden": 0.9952029390260577,
+    "minmax4": 0.9878237075172365
+  },
+  "prefix_rank_R@10": {
+    "eden": 0.8718750000000006,
+    "minmax4": 0.7851562499999993
+  },
+  "prefix_recon_mse": {
+    "eden": 7.126053279227126e-6,
+    "minmax4": 0.000028030031526211052
+  },
+  "seed": 1
+}
