@@ -1,5 +1,5 @@
 # Local validation / parquet tooling for MS MARCO bench artifacts
 pyarrow>=17.0.0
 numpy>=1.26
-datasets>=3.2.0
+datasets>=5.0.1
 huggingface-hub>=0.30.0
