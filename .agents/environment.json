@@ -1,0 +1,3 @@
+{
+  "install": "touch ~/.bashrc && (sed -i '/case \\$- in/,/esac/d' ~/.bashrc 2>/dev/null || true) && ([ -d \"$HOME/.venv\" ] || uv venv \"$HOME/.venv\") && uv pip install --python \"$HOME/.venv/bin/python\" -r modal/requirements-bench-data.txt -r modal/requirements.txt && EXPORT_LINE=\"export PATH=\\\"\\$HOME/.venv/bin:$(pwd)/target/release:\\$HOME/.cargo/bin:\\$PATH\\\"\" && (grep -qxF \"$EXPORT_LINE\" ~/.bashrc || echo \"$EXPORT_LINE\" >> ~/.bashrc) && export PATH=\"$HOME/.venv/bin:$(pwd)/target/release:$HOME/.cargo/bin:$PATH\" && cargo fetch && cargo build --release"
+}
